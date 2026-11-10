@@ -2,12 +2,21 @@
 
 本目录预留容量治理、备份、恢复和升级任务。当前只有管理约定，没有运行中的定时任务，也没有自动删除、备份或恢复脚本。
 
+## 多机器采集与远程访问
+
+中心 Collector、ClickHouse、HyperDX、MongoDB 仍由同一份 Compose 管理。Collector 使用独立采集配置和预配置凭据，业务机器通过中心可达的 OTLP 地址上传日志、Span；读取日志文件的 Agent 部署在各自业务机器上。
+
+完整地址配置、直接 HTTP 访问和公网 HTTPS 的选择见 [多机器采集与 HyperDX 远程访问](remote-access.md)。HyperDX 原生支持发布 HTTP 端口供其他电脑访问；公网 HTTPS 可由 Nginx、Caddy 或云负载均衡器提供，核心 Compose 不强制增加代理服务。
+
+[宿主机 Nginx 示例](nginx-hyperdx.conf.example) 包含整个 HyperDX 站点的 HTTPS 转发，以及可选 OTLP HTTP HTTPS 入口。示例不自动加载或申请证书；域名、证书、端口和网络入口由部署方按实际环境配置。
+
 ## 当前配置已覆盖
 
 - ClickHouse 与 MongoDB 数据绑定到 `.data/`，容器正常替换时保留数据。
 - 每个容器自身日志轮转，以及 ClickHouse 文本日志和部分系统表保留规则。
-- 遥测新建表的统一保留参数，以及已执行的分类型保留规则 SQL。
+- 遥测新建表的统一保留参数，以及可选的分类型保留规则 SQL；已有表以实际表定义为准。
 - 容器内存限制和 Collector 内存保护。
+- 独立 Collector 的静态采集认证，以及可配置的远程采集、HyperDX 访问入口。
 
 这些措施不等于总磁盘容量上限，也不等于备份。单机磁盘故障仍会影响整个部署。
 

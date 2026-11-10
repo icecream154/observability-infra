@@ -7,7 +7,7 @@
         <count>3</count>
     </logger>
 
-    <!-- 2. 仅在容器网络内提供数据库自身指标，供官方 Collector 默认管道抓取。 -->
+    <!-- 2. 仅在容器网络内提供数据库自身指标，由中心独立 Collector 的 Prometheus 接收器抓取。 -->
     <prometheus>
         <endpoint>/metrics</endpoint>
         <port>9363</port>

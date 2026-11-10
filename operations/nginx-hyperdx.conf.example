@@ -1,0 +1,85 @@
+# 宿主机 Nginx 的可选 HTTPS 配置示例，不会被本项目 Compose 自动加载。
+# 适用场景：Nginx 与 observability-infra 位于同一台宿主机；它们通过宿主机回环端口连接。
+# 使用前替换域名、证书路径和上游端口。证书由部署方准备，此文件不会自动申请证书。
+# 将 server 块放入 Nginx 的 http 上下文，例如部署方已有的 conf.d/站点配置文件。
+#
+# 对应中心 .env：
+#   HYPERDX_BIND_ADDRESS=127.0.0.1
+#   HYPERDX_PUBLIC_URL=https://logs.example.com
+#   OTLP_BIND_ADDRESS=127.0.0.1
+#
+# 以上 OTLP 回环绑定适用于本文件同时代理 OTLP HTTP 的情况。
+# 外部业务端使用 https://otel.example.com，并继续携带预配置的 OTLP_AUTH_TOKEN。
+# 本示例不提供 OTLP gRPC 的 TLS 代理，4317 不会因这些 server 块而对外可达。
+
+# 1. HyperDX 的 HTTP 入口重定向到 HTTPS。
+server {
+    listen 80;
+    server_name logs.example.com;
+
+    return 301 https://logs.example.com$request_uri;
+}
+
+# 2. HyperDX 公网 HTTPS 入口；整个站点转给前端，不需要单独发布 API 端口。
+server {
+    listen 443 ssl;
+    server_name logs.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/logs.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/logs.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # 与实际页面请求大小和后端限制一起评估；它不是 ClickHouse 的数据库容量限制。
+    client_max_body_size 32m;
+
+    location / {
+        # 宿主机端口应与 HYPERDX_APP_PORT 对应；没有添加 URI 后缀，保留原始请求路径。
+        # /api/... 先到 Next.js 前端，再由前端通过 SERVER_URL 转发到同容器 API。
+        proxy_pass http://127.0.0.1:18080;
+        proxy_http_version 1.1;
+
+        # 保留实际访问 Host、客户端链路和 HTTPS 协议信息，供会话和重定向处理使用。
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 允许查询和流式响应持续返回；根据部署侧超时策略调整。
+        proxy_read_timeout 300s;
+        proxy_buffering off;
+    }
+}
+
+# 3. 可选：OTLP HTTP 的独立 HTTPS 入口。
+# 不需要该入口时，可移除下面整个 server 块，并按实际内网采集方式设置 OTLP_BIND_ADDRESS。
+# 本示例直接接受 HTTPS；发送端应直接使用 HTTPS 地址，不依赖 HTTP 重定向上传日志。
+server {
+    listen 443 ssl;
+    server_name otel.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/otel.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/otel.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Nginx 默认请求体限制可能小于 OTLP 批次；这里给出示例值，仍需与 Collector 限制配合。
+    client_max_body_size 20m;
+
+    # 只转发三类 OTLP HTTP 上传路径，避免意外代理其他内部入口。
+    location ~ ^/v1/(logs|traces|metrics)$ {
+        proxy_pass http://127.0.0.1:4318;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 透传发送端凭据，由 Collector 校验；无需将实际密钥写入 Nginx 配置。
+        proxy_set_header Authorization $http_authorization;
+        proxy_read_timeout 60s;
+    }
+
+    location / {
+        return 404;
+    }
+}

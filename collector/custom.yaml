@@ -3,9 +3,13 @@
 # 这是当前 ClickStack Collector 的自定义配置片段，用于调整已有处理器的参数。
 # compose.yaml 将本文件只读挂载到容器内 /etc/otelcol-contrib/custom.yaml，
 # 再通过 CUSTOM_OTELCOL_CONFIG_FILE 告诉镜像去加载它。
-# 当前使用 hyperdx/hyperdx-otel-collector:2.43.1，并通过 OpAMP 从 app 获取远程配置；
-# 最终配置由“镜像内置配置 + 本文件 + OpAMP 下发配置”共同组成。
-# 本文件只修改 memory_limiter 和 batch，保留其他内置处理、接收器、认证和导出配置。
+# 当前使用 hyperdx/hyperdx-otel-collector:2.43.1 的 standalone 独立模式，不连接 app 的 OpAMP。
+# 镜像入口脚本按顺序加载：
+#   内置 config.yaml -> standalone-config.yaml -> standalone-auth-config.yaml -> 本文件。
+# 静态认证文件由必填的 OTLP_AUTH_TOKEN 启用，同时保护 HTTP/gRPC；密钥由部署配置预先提供。
+# 最终配置不依赖 HyperDX 账号创建、团队 Ingestion key、MongoDB 或 UI 是否运行。
+# 本文件调整 memory_limiter/batch、覆盖建表默认 TTL，并补充 ClickHouse 自身指标抓取。
+# 不重复定义内置 OTLP 接收器或认证扩展，避免与镜像中的已配置能力发生偏差。
 #
 # Collector 的数据处理结构是：
 #   receivers（接收） -> processors（处理） -> exporters（导出到 ClickHouse）。
@@ -17,11 +21,30 @@
 # transform 是镜像内置的日志转换处理器，本文件没有修改它。
 # 先进行内存保护，再转换和积累批次，可以尽早向上游反馈内存压力。
 #
-# 本文件没有单独声明 receivers、exporters 和完整的 service.pipelines，
+# 本文件没有定义所有接收器、导出器和完整的 service.pipelines，
 # 不能直接当作普通 OpenTelemetry Collector 的完整配置独立启动。
 # 它也没有声明读取电脑业务日志目录的 filelog 接收器；业务数据仍需由 SDK 或客户端采集器发送。
+
+# 2. 数据库自身指标接收器
+# -----------------------------------------------------------------------------
+# 为 ClickHouse 的 /metrics 定义明确的 Prometheus 抓取管道。
+# 9363 由项目的 ClickHouse XML 配置开启，仅用于数据库自身指标，不是业务 OTLP 接收或 remote-write 入口。
+# 远端 Go/Python 的日志、Span 等仍从内置 OTLP 接收器进入；此 receiver 不读取远端日志文件。
+# 只声明 receiver 不会自动运行，文件末尾的 metrics/clickhouse 管道负责引用它。
+receivers:
+  prometheus/clickhouse:
+    config:
+      scrape_configs:
+        - job_name: clickhouse
+          scrape_interval: 30s
+          # Prometheus 的默认 metrics_path 为 /metrics，这里显式写出便于理解。
+          metrics_path: /metrics
+          static_configs:
+            # ${env:...} 由 Collector 读取自己的环境，不是由宿主机 Compose 直接处理挂载文件。
+            - targets: ["${env:CLICKHOUSE_METRICS_TARGET:-clickhouse:9363}"]
+
 processors:
-  # 2. memory_limiter：内存保护与背压
+  # 3. memory_limiter：内存保护与背压
   # ---------------------------------------------------------------------------
   # 目的：在内存压力过大时暂时拒收更多数据，给现有处理、导出和内存回收留出时间，降低 OOM 风险。
   # “背压”是把暂时处理不了的状态向前传递，使接收器、客户端有机会减速或重试。
@@ -35,9 +58,10 @@ processors:
   #  1024 MiB：Compose 为整个容器设置的内存上限。
   #
   # 当前组件版本观察的是 Collector 进程的 Go 堆内存（runtime.MemStats.Alloc）。
-  # Collector 的栈、原生分配、其他运行开销，以及独立 Supervisor 进程等，
+  # Collector 的栈、原生分配及其他运行开销，
   # 不应直接等同于这个堆内存数值；docker stats 看到的容器内存也不一定与它相同。
   # 此阈值面向 Collector 进程整体的堆使用，不是日志、Trace、指标各自获配 768 MiB。
+  # 当前独立模式直接运行 Collector，不再运行 OpAMP Supervisor。
   #
   # memory_limiter 的“硬阈值”表示需要进一步采取内存回收动作，
   # 不是操作系统强制封顶；它不能保证内存绝不会超过 768 MiB，更不能替代容器限额。
@@ -67,7 +91,7 @@ processors:
     # 128 MiB 只是配置假设，实际突发仍可能超过它。
     spike_limit_mib: 128
 
-  # 3. batch：将记录积累成批次，再交给后续导出器
+  # 4. batch：将记录积累成批次，再交给后续导出器
   # ---------------------------------------------------------------------------
   # 目的：减少零碎的导出调用，改善网络传输和 ClickHouse 批量写入的效率。
   # 代价：尚未发送的数据暂存在内存，批次过大可能增加内存占用；等待成批也会增加一些处理延迟。
@@ -101,12 +125,37 @@ processors:
     # 增大批次不等于一定更快，需要同时考虑内存额度、消息大小和下游写入能力。
     send_batch_max_size: 2000
 
-# 4. 可靠性与后续修改
+# 5. 覆盖已有 ClickHouse 导出器的新表默认 TTL
+# -----------------------------------------------------------------------------
+# 当前 2.43.1 的 standalone 配置在两个导出器中都写死 ttl: 720h。
+# 这里仅覆盖 ttl，保留镜像已有的 endpoint、database、认证、表名、建表和重试等配置。
+# 因而 compose.yaml 注入的 HYPERDX_OTEL_EXPORTER_TABLES_TTL（来自 TABLES_RETENTION）实际用于建表。
+# 720h = 30 天；默认保留统一期限时不需要执行 retention.sql。
+# 已有表不会随此配置或 Collector 重启迁移 TTL，需另行执行 ALTER TABLE 并查看实际表定义。
+exporters:
+  clickhouse:
+    ttl: ${env:HYPERDX_OTEL_EXPORTER_TABLES_TTL:-720h}
+  # standalone 内置 routing 还包含 Session/rrweb 分支，虽然本项目尚未接入，也保持其默认期限一致。
+  clickhouse/rrweb:
+    ttl: ${env:HYPERDX_OTEL_EXPORTER_TABLES_TTL:-720h}
+
+# 6. 启用新增的数据库指标管道
+# -----------------------------------------------------------------------------
+# 内置 standalone 文件已连接三类业务 OTLP 管道，本段只增加 metrics/clickhouse。
+# 不定义 service.extensions 列表：列表在合并时会替换，保留内置 health_check 和静态 token 认证扩展。
+service:
+  pipelines:
+    metrics/clickhouse:
+      receivers: [prometheus/clickhouse]
+      processors: [memory_limiter, batch]
+      exporters: [clickhouse]
+
+# 7. 可靠性与后续修改
 # -----------------------------------------------------------------------------
 # memory_limiter 负责内存压力控制，batch 负责批量传递；二者都不提供磁盘持久化和断电恢复能力。
 # 当前没有在本文件或 Compose 中增加持久发送队列；进程退出、持续故障或重试耗尽时仍可能丢数据。
 # 调整参数时，应同时观察真实负载下的内存峰值、拒收/丢弃情况、导出错误及数据到达延迟。
-# 只修改注释不会改变运行行为，无需为本次注释更新重启服务。
+# 仅修改注释不会改变运行行为；实际参数需要运行中的 Collector 重新加载。
 # 以后修改实际参数，可正常重启 collector 让其重新加载挂载文件；
 # 如果同时修改 .env 或 Compose 的容器环境/资源配置，应使用 Compose 更新容器配置。
 #

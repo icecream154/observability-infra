@@ -1,194 +1,174 @@
 # Observability Infra
 
-本项目维护共享可观测平台的部署配置、采集约定和运维说明。当前采用 ClickStack 开源组件，通过 Docker Compose 部署官方 UI/API、Collector、ClickHouse 和 MongoDB；不编译或修改 ClickStack 源码。
+本项目维护公共 Demo 的中心可观测基础设施：**独立 Collector + ClickHouse + HyperDX + MongoDB**。四个中心组件仍部署在同一台服务器、由同一份 Docker Compose 管理；多台 Go/Python 业务机器通过 OTLP 汇聚日志和 Span。
 
-当前为**已启动并通过组件健康检查的本地单机平台**（2026-11-10）。已生成本地 `.env`，四个组件均为 healthy；尚未创建平台账号，也未接入业务服务的日志、Span 和指标。客户端日志采集、容量水位自动清理、备份任务、业务看板及 Profiling 均需后续接入。
+Collector 保留 `hyperdx/hyperdx-otel-collector:2.43.1`，使用它真正的 **standalone 独立模式**，沿用已有导出器和 legacy/Map 表结构。不需要先启动 HyperDX、注册账号或获取 UI 团队密钥才能初始化采集。所有镜像固定版本，不编译上游源码。
 
-## 目录和文件含义
+从配置逐项学习整条链路，可先阅读带架构图、启动图和时序图的 [Compose 配置与链路详解](compose-yaml.md)。
 
-```text
-observability-infra/
-├── README.md
-├── compose.yaml
-├── .env.example
-├── .gitignore
-├── go.mod
-├── collector/
-│   ├── README.md
-│   └── custom.yaml
-├── clickhouse/
-│   ├── README.md
-│   ├── retention.sql
-│   └── config.d/
-│       └── observability.xml
-├── dashboards/
-│   └── README.md
-└── operations/
-    └── README.md
-```
-
-| 文件 | 含义 | 如何使用或生效 |
-| --- | --- | --- |
-| `README.md` | 项目入口，说明文件职责、部署步骤和当前能力边界 | 阅读本文 |
-| `compose.yaml` | 定义四个组件的镜像、端口、内存、依赖、挂载和日志轮转 | `docker compose` 读取 |
-| `.env.example` | 镜像版本、端口、密钥和保留时长的配置模板 | 复制为 `.env` 后填写；示例本身不会自动加载 |
-| `.gitignore` | 排除实际密钥、持久化数据、备份和 IDE 文件 | Git 使用；本项目当前无需自动初始化 Git |
-| `go.mod` | 创建项目时已有的 Go 模块声明 | 原样保留；当前 Compose 部署不需要编译 Go 程序 |
-| `collector/README.md` | 说明中心 Collector、上传认证、字段映射以及未来客户端采集职责 | 采集接入时参考 |
-| `collector/custom.yaml` | 官方 Collector 的配置合并片段，设置内存保护和批处理 | 由 Compose 挂载，通过 `CUSTOM_OTELCOL_CONFIG_FILE` 加载 |
-| `clickhouse/README.md` | 说明存储目录、遥测表、TTL 和已有表变更方式 | 存储管理时参考 |
-| `clickhouse/config.d/observability.xml` | ClickHouse 自身日志轮转、诊断表保留规则和内部指标端点 | 挂载到数据库 `config.d`，启动时合并 |
-| `clickhouse/retention.sql` | 根据已核验的 2.43.1 表结构设置日志/Span 7 天、指标 30 天 TTL | 首次建表后显式执行；本机已执行并核验 |
-| `dashboards/README.md` | 约定看板定义和统计口径，避免把 Span 数当作接口调用数 | 后续增加经过验证的看板配置和查询 |
-| `operations/README.md` | 说明容量治理、备份、恢复及升级职责 | 运维实施依据；当前不含自动删除或备份程序 |
-
-运行时会产生 `.env` 和 `.data/`，它们不应提交到版本控制。目录内用实际说明文件保留职责，不使用 `.gitkeep`。
-
-## 数据流和组件职责
+## 组件与数据流
 
 ```mermaid
 flowchart LR
-    A["业务服务 / 后续客户端 Collector"] -->|"OTLP + 采集密钥"| B["中心 Collector"]
-    B --> C["ClickHouse：日志 / Span / 指标"]
-    D["ClickStack UI / API"] --> C
-    D --> E["MongoDB：账号 / 看板 / 告警配置"]
-    D -. "OpAMP：接收配置与认证" .-> B
+    subgraph A[业务机器 A]
+        Go[Go 服务] --> AgentA[本机日志/OTLP Agent]
+    end
+    subgraph B[业务机器 B]
+        Python[Python 服务] --> AgentB[本机日志/OTLP Agent]
+    end
+    subgraph C[中心服务器：一个 Compose]
+        Collector[独立 Collector] --> CH[ClickHouse：遥测明细]
+        UI[HyperDX：查询和展示] --> CH
+        UI --> Mongo[MongoDB：账号/会话/看板]
+    end
+    AgentA -->|OTLP + 预配置凭据| Collector
+    AgentB -->|OTLP + 预配置凭据| Collector
 ```
 
-`Logs`、`Traces`、`Metrics` 的默认数据源已在 Compose 中声明，日志与 Trace 按名称双向关联。数据源配置用于首次账号初始化；修改 Compose 不应被当作已有账号的数据源迁移手段。已有配置需通过 UI/API 检查和更新。
+业务 SDK 也可以直接向中心发送 OTLP。读取文件的 Agent 应部署在日志所在的业务机器上；中心服务器的目录挂载无法读取另一台机器的本地文件。普通 Compose 管理中心这一台机器上的容器，不负责跨机器调度业务 Agent。
 
-## 本地部署步骤
+Collector 仅等待 ClickHouse 健康。HyperDX 查询 ClickHouse，并将自身平台状态保存在 MongoDB；它不再向 Collector 下发 OpAMP 配置，也不控制采集密钥。
 
-以下步骤用于复现部署。本机已经完成 `.env` 配置和首次启动；不要用空白示例覆盖现有 `.env`。
+## 文件职责
 
-### 1. 准备环境和密钥
+| 文件 | 职责与生效方式 |
+| --- | --- |
+| `compose.yaml` | 中心四组件的镜像、依赖、端口、环境变量、挂载和详细注释 |
+| `compose-yaml.md` | 从 Compose 入口解释多机汇聚、配置加载、认证、存储和网页访问链路，配套 Mermaid 图 |
+| `.env.example` | 公共配置模板，不包含实际密钥；复制为 `.env` 后设置真实参数 |
+| `.env` | 当前部署的私有参数；不提交到公共仓库 |
+| `collector/custom.yaml` | 与镜像基础、standalone 管道和静态认证配置合并；设置内存/批处理、TTL、ClickHouse 自身指标抓取 |
+| `collector/README.md` | 独立采集模式、凭据、管道及业务机器接入约定 |
+| `clickhouse/config.d/observability.xml` | ClickHouse 文件日志、系统诊断表 TTL 和内部 `9363/metrics` 入口 |
+| `clickhouse/retention.sql` | 可选的分类型保留规则；表创建后显式执行，不会随 Compose 自动运行 |
+| `operations/remote-access.md` | 远程 HTTP、公网 HTTPS 和多机器网络配置说明 |
+| `operations/nginx-hyperdx.conf.example` | 可选宿主机 Nginx HTTPS 示例；不会自动加载，不包含真实域名或证书 |
+| `operations/README.md` | 容量、备份、升级和运维边界 |
+| `dashboards/README.md` | 后续看板与统计口径约定 |
 
-安装支持 Compose v2 或更新版本的 Docker。示例模板的四个容器内存上限合计为 8 GiB。本机 Docker 可用约 8 GiB，因此实际 `.env` 使用 ClickHouse 3 GiB、UI/API 1 GiB、MongoDB 512 MiB、Collector 1 GiB，合计 5.5 GiB，以预留运行空间。这些资源值尚未经过业务负载验证。
+`.data/` 保存数据库数据，`go.mod` 保留项目模块声明，当前 Compose 不需要编译 Go 代码。
 
-在项目根目录执行：
+## 部署前一次性配置
 
-```bash
-test -e .env || cp .env.example .env
-```
+### 1. 准备私有配置和三种密钥
 
-分别执行两次以下命令，把两个不同的结果填写到 `.env` 的 `CLICKHOUSE_PASSWORD` 和 `EXPRESS_SESSION_SECRET`：
+首次使用时复制 `.env.example` 为 `.env`；已有 `.env` 不要用空白模板覆盖。分别生成三个不同的随机值：
 
 ```bash
 openssl rand -hex 32
 ```
 
-ClickHouse 密码使用生成的十六进制字符串，避免破坏 Compose 中的连接 JSON。空密钥会使 Compose 校验失败。本机已生成两个独立随机值，并将 `.env` 权限设为 `0600`。平台登录账号将在 UI 中创建；这两个值均不是业务上传时使用的 Ingestion API Key。
+将不同结果填入：
 
-### 2. 校验、拉取和启动
+| 配置项 | 作用 |
+| --- | --- |
+| `CLICKHOUSE_PASSWORD` | Collector/app 连接 ClickHouse 的数据库密码 |
+| `EXPRESS_SESSION_SECRET` | HyperDX 登录会话签名密钥，普通重启保持稳定 |
+| `OTLP_AUTH_TOKEN` | 独立 Collector 接收日志、Span、指标时校验的共享采集凭据 |
+
+`OTLP_AUTH_TOKEN` 可以在部署前生成。SDK/Agent 与中心使用约定的相同值，无需先登录 HyperDX。它与 UI 中显示的团队 Ingestion API key 是独立的；**本部署使用 `.env` 的 `OTLP_AUTH_TOKEN` 验证上传**。
+
+使用十六进制随机值：ClickHouse 密码会插入 JSON，采集密钥会拼入标准 OTLP headers。`.env` 应限制读取权限；生产环境可以由部署 Secret 提供同名变量。实际密钥不写入示例文件和文档。
+
+### 2. 保留 Demo 默认值，或填写真实部署地址
+
+| 配置项 | Demo 默认值 | 真实场景中的取值 |
+| --- | --- | --- |
+| `HYPERDX_BIND_ADDRESS` | `0.0.0.0` | 全部网卡、指定内网 IP，或本机代理后的 `127.0.0.1` |
+| `HYPERDX_PUBLIC_URL` | `http://localhost:18080` | 浏览器真正使用的完整 origin，包括协议和必要端口 |
+| `HYPERDX_APP_PORT` | `18080` | HyperDX 前端端口 |
+| `HYPERDX_API_PORT` | `18001` | 内部 API 端口，宿主机仅回环发布 |
+| `OTLP_BIND_ADDRESS` | `0.0.0.0` | 业务机器可达的中心内网 IP，或 HTTPS 代理后的回环地址 |
+| `OTLP_HTTP_PORT` | `4318` | OTLP HTTP 发布端口 |
+| `OTLP_GRPC_PORT` | `4317` | OTLP gRPC 发布端口 |
+
+`0.0.0.0` 是监听范围，不能作为浏览器或 SDK 的目标地址。其他电脑应使用中心服务器的实际 IP/域名。Docker 内的 `collector`、`clickhouse`、`mongodb` 只用于同网容器间通信。
+
+原生远程 HTTP 不需要增加 Nginx。实际远程登录前，将 `HYPERDX_PUBLIC_URL` 改为真实 URL；它决定 Cookie、登录跳转、链接和跨域行为。Demo 不预填真实公网地址。
+
+公网 HTTPS 由 Nginx、Caddy 或云负载均衡器终止 TLS。只填写 `https://...` 不会让 HyperDX 自动启用 TLS 或申请证书。具体参数和可选示例见[远程访问说明](operations/remote-access.md)。
+
+### 3. 启动中心组件
+
+在项目目录执行：
 
 ```bash
-docker compose config --quiet
-docker compose pull
 docker compose up -d
-docker compose ps
 ```
 
-`config --quiet` 只做配置检查；不要把包含密钥的完整渲染配置粘贴到公开日志中。上述配置检查不能替代镜像运行和业务接入验收。
+Compose 根据变更更新容器。Collector 会从本地配置加载静态认证和导出管道，HyperDX 无需先创建账号。需要查看页面时，再打开 `HYPERDX_PUBLIC_URL` 并注册/登录；账号和看板等平台状态保存在 MongoDB。
 
-平台完成首次建表后，执行分类型保留规则。本机已执行，不需要在每次重启时重复执行；未来变更前先核对实际表结构和保留目标。
+从旧 OpAMP 配置迁移时，先填写新增的 `OTLP_AUTH_TOKEN`，再更新容器。原有 ClickHouse/MongoDB 挂载目录继续使用，已有数据库密码、会话密钥、平台账号和表数据保留。Go/Python/Agent 上传凭据需要切换为预配置 token；旧的 HyperDX 团队 key 不会自动成为独立 Collector 的有效凭据。
+
+仅修改 `.env` 后执行 `docker compose restart` 不会注入新环境变量；应使用 `docker compose up -d`。只修改挂载的 Collector 参数文件时，可重启 Collector 让其重新读取。
+
+## 多台业务机器如何接入
+
+中心默认开放两个经过静态 token 认证的入口：
+
+| 协议 | 业务机器的目标地址 | 信号 |
+| --- | --- | --- |
+| OTLP HTTP | `http://中心内网IP:4318`，或已配置的 HTTPS OTLP 域名 | `/v1/logs`、`/v1/traces`、`/v1/metrics` |
+| OTLP gRPC | `中心内网IP:4317`，或相应 TLS 入口 | 日志、Span、指标 |
+
+发送端携带 `authorization: <OTLP_AUTH_TOKEN>`，也接受 `Bearer <OTLP_AUTH_TOKEN>`。例如支持标准 OTLP 环境配置的 SDK 可读取：
+
+```text
+OTEL_EXPORTER_OTLP_ENDPOINT=http://中心内网IP:4318
+OTEL_EXPORTER_OTLP_HEADERS=authorization=<预配置token>
+```
+
+上面是配置形式，不是真实地址/密钥。SDK 需要实际装配导出器；仅写环境变量不会让尚未实现导出的项目自动上报。注意区分 SDK 接受基础地址还是包含 `/v1/traces` 等路径的完整地址。公网传输使用 HTTPS/TLS，中心网络入口只允许预期的业务机器访问。
+
+每个逻辑服务设置 `service.name`，每个实例设置 `service.instance.id`，环境使用 `deployment.environment.name`。这些属性用于查询和区分来源，不等于自动建立租户隔离。
+
+业务机器后续分别配置：
+
+1. 日志输出到受轮转管理的 JSONL 文件，由该机器的 Agent 持续读取并保存读取位置。
+2. 将日志正文、时间、级别、TraceId、SpanId 和资源属性映射到标准字段，再上传。
+3. 为 Go/Python 的已有 Span 接入 OTLP 导出器；可以先发本机 Agent，再统一转发到中心。
+
+当前变更只覆盖中心配置，没有在业务机器部署 Agent，也没有修改 Go/Python 的 Logger 或 Span 导出代码。
+
+## 查询和数据保留
+
+Compose 的 `DEFAULT_CONNECTIONS` / `DEFAULT_SOURCES` 为新团队提供 ClickHouse 连接及 Logs/Traces/Metrics 映射。已有配置在 **Team Settings → Data → Connections/Sources** 编辑，保存到 MongoDB；修改默认模板不会自动覆盖已有配置。
+
+新表默认使用 `TABLES_RETENTION=720h`（30 天）。`collector/custom.yaml` 显式覆盖 standalone 中两个 ClickHouse 导出器的默认 TTL，让这一变量生效。接受统一 30 天的新环境不需要执行 `retention.sql`。
+
+需要日志、Span 和 TraceId 时间索引 7 天、指标 30 天的分类型策略时，在对应表创建完成后显式执行：
 
 ```bash
 docker compose exec -T clickhouse sh -c 'exec clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --multiquery' < clickhouse/retention.sql
 ```
 
-此版本镜像自带的应用健康检查固定访问 8000；Compose 已覆盖为实际端口的 API `/ready`、前端页面和 OpAMP `/ready` 检查，Collector 在应用健康后启动。
+此命令修改已有表规则，文件本身不会自动执行。修改 `.env` 不迁移已有表 TTL，不再执行 SQL 也不会将已有 7 天期限恢复为 30 天。规则保存在 ClickHouse 表定义中，后台持续处理过期数据，普通重启无需重复执行 SQL。实际保留规则以表定义为准。
 
+## 持久化、资源与维护
 
-### 3. 打开平台并取得上传密钥
-
-浏览器打开 <http://localhost:18080>，创建本地平台账号。当前页面显示账号创建界面，没有预设登录邮箱或密码。创建后进入 Add Data 或 Team Settings 的 API Keys 页面取得 Ingestion API Key。
-
-在首次账号和 Team 创建前，官方 OpAMP 管道不会启用 OTLP 接收器，因此此时 4317/4318 尚不能接收遥测是预期状态；Collector 健康并不等于采集入口已激活。创建账号后再验证带认证的上传链路。
-
-| 入口 | 默认地址 | 说明 |
-| --- | --- | --- |
-| UI | `http://localhost:18080` | 查看日志、Trace 和看板 |
-| UI API | `http://localhost:18001` | 由浏览器 UI 使用 |
-| OTLP HTTP | `http://localhost:4318` | 日志、Span、指标的上传基础地址 |
-| OTLP gRPC | `localhost:4317` | gRPC 上传入口 |
-| OpAMP | Compose 内部 `app:4320` | Collector 配置控制入口，不映射宿主机 |
-| ClickHouse / MongoDB | Compose 内部 | 不映射宿主机数据库端口 |
-
-OTLP HTTP 的信号路径分别为 `/v1/logs`、`/v1/traces`、`/v1/metrics`，发送端需要添加 `authorization: <Ingestion API Key>`。实际使用 SDK 时，注意区分它接受“基础地址”还是“完整信号 URL”。
-
-所有发布端口默认只监听 `127.0.0.1`。当前浏览器 URL 也按 localhost 配置，因此这不是直接供多台机器访问的部署配置。远程部署时需要同时调整监听地址、浏览器访问 URL、认证和传输保护。
-
-### 4. 接入业务数据
-
-平台启动后不会自动获得业务服务终端中的日志，也不会自动导出业务进程中已创建的 Span。后续需要：
-
-1. 在业务项目中配置 OpenTelemetry Span 导出，并保持服务名、环境、实例标识与日志一致。
-2. 确定日志来源，配置客户端 Collector 读取 JSON 日志、解析字段并上传。
-3. 验证同一 TraceId 的日志与 Span 可以关联，再接入 Counter、Histogram 和运行时指标。
-
-本轮没有修改 `go-service-template`，也没有发起业务 HTTP 或 SDK 调用。
-
-## 数据持久化和容量边界
-
-| 本地路径 | 内容 |
+| 宿主机目录 | 内容 |
 | --- | --- |
-| `.data/clickhouse/` | 日志、Span、指标表和 ClickHouse 内部数据 |
+| `.data/clickhouse/` | 遥测表、数据库元数据和内部诊断数据 |
 | `.data/clickhouse-logs/` | ClickHouse 自身文本日志 |
-| `.data/mongodb/` | 平台账号、看板和其他配置 |
+| `.data/mongodb/` | HyperDX 平台状态和会话 |
 
-普通重启及 `docker compose down` 不会移除这些绑定目录。不要把删除 `.data/` 当成常规重启步骤。
+ClickHouse/MongoDB 端口不向业务机器发布；它们只需要访问 Collector。API 调试端口仅本机访问，浏览器从前端同源 `/api` 代理进入 API。
 
-当前 2.43.1 legacy/OpAMP 管道通过 `TABLES_RETENTION=720h` 设置统一建表默认值，不读取分信号 TTL 环境变量。`clickhouse/retention.sql` 显式将日志、Span 和 TraceId 查询索引设为 7 天，五类指标表设为 30 天；本机已执行并从实际表定义核验。其他表仍按其实际配置管理，例如未启用的 Session 数据表默认 30 天。TTL 异步执行，不是实时磁盘容量上限。容器内存限制、控制台日志轮转也不能代替数据库容量配额。
+示例默认内存额度为 ClickHouse 4 GiB、app 2 GiB、MongoDB 1 GiB、Collector 1 GiB，可按宿主机与总流量调整。修改 Collector 额度时同时核对 `custom.yaml` 中固定的堆内存保护阈值。当前没有配置持久发送队列、总磁盘硬配额、自动水位清理或备份任务，不能将单机部署视为故障零丢失或已完成容量规划。
 
-当前没有实现总容量达到水位后的自动删除，也没有配置 Collector 持久发送队列。中心不可用或队列耗尽时可能丢失数据。具体后续职责见 [采集说明](collector/README.md) 和 [运维说明](operations/README.md)。
-
-## 停止和查看状态
+停止中心组件：
 
 ```bash
-docker compose ps
-docker compose logs --tail=100 collector
 docker compose down
 ```
 
-## 版本与维护方式
-
-应用和 Collector 固定为上游 `2.43.1`，保留其官方 `hyperdx/*` 镜像名称；ClickHouse 和 MongoDB 使用明确版本。镜像名称保留 HyperDX 不意味着部署的是另一套平台。升级前需要复核兼容性、备份、已有表及数据源变更。
-
-本仓库维护配置，不维护 ClickStack 源码分支。只有现有查询和页面确实不能满足交互需求时，再考虑独立页面或前端定制。当前没有自动生成或导入任何业务看板。
-
-## 本次检查范围
-
-已完成 Compose 静态解析、必填密钥检查、连接和数据源 JSON 解析、挂载路径检查、Collector YAML 与 ClickHouse XML 语法检查；公开镜像标签及 amd64/arm64 支持已核验。
-
-2026-11-10 完成本地启动检查：
-
-| 项目 | 结果 |
-| --- | --- |
-| ClickHouse / MongoDB / UI/API / Collector | 四个容器均 running、healthy；检查时无异常重启 |
-| 前端 | 浏览器显示首次账号创建界面 |
-| API `/health`、`/ready` | HTTP 200；MongoDB 连接正常 |
-| OpAMP `/ready`、Collector `13133/` | 内部访问 HTTP 200 |
-| ClickHouse 内部 `9363/metrics` | HTTP 200，未映射宿主机端口 |
-| 保留规则 | 实际表定义为日志/Span 7 天、指标 30 天 |
-| 平台账号 | 尚未创建；OTLP 接收待首次创建账号后启用 |
-
-没有接入业务服务，没有发起业务 HTTP/SDK 请求或发送合成遥测验收数据，也没有新增测试用例。本次只验证基础组件、平台页面、内部连接和表配置；不代表业务数据端到端联动已验收。
-
-## YouTube 学习资料
-
-以下均为 ClickHouse 官方视频，主要使用英文，建议按顺序观看；界面和功能可能随版本变化。
-
-1. [Introducing ClickStack — Mark Needham](https://www.youtube.com/watch?v=3waDYancX_c)：架构、Docker 启动、日志查询和 Collector 入门。
-2. [Introducing ClickStack: Live Demo and Q&A — Mike Shi](https://www.youtube.com/watch?v=IUu-0dWv0sI)：日志、Trace 和指标的完整产品演示。
-3. [ClickStack Demo Days #1](https://www.youtube.com/watch?v=90NWWl6HkPI)：SQL 图表、Trace 时间线及 Span 分析。视频还包含其他产品功能演示，不应将所有片段都视为当前开源部署的能力。
-
+普通重启或删除容器不会自动删除上述绑定目录。容量、备份和升级职责见[运维说明](operations/README.md)。
 
 ## 官方参考
 
-- [ClickStack 开源架构](https://clickhouse.com/docs/clickstack/architecture)
-- [官方 Docker Compose 部署](https://clickhouse.com/docs/clickstack/deployment/docker-compose)
-- [上游发布版本](https://github.com/ClickHouse/ClickStack/releases)
-- [官方 Compose 配置](https://github.com/ClickHouse/ClickStack/blob/main/docker-compose.yml)
-- [官方 Collector 配置](https://github.com/ClickHouse/ClickStack/blob/main/docker/otel-collector/config.yaml)
-- [ClickStack TTL 管理](https://clickhouse.com/docs/clickstack/managing/ttl)
-- [生产部署说明](https://clickhouse.com/docs/clickstack/managing/production)
+- [独立 UI 与自有采集管道](https://clickhouse.com/docs/clickstack/deployment/hyperdx-only)
+- [HyperDX 配置项](https://clickhouse.com/docs/clickstack/managing/config)
+- [对应版本 Collector 入口脚本](https://github.com/hyperdxio/hyperdx/blob/821c2f93357b47d5ff932ea99d2adf93289815a5/docker/otel-collector/entrypoint.sh)
+- [对应版本 standalone 管道](https://github.com/hyperdxio/hyperdx/blob/821c2f93357b47d5ff932ea99d2adf93289815a5/docker/otel-collector/config.standalone.yaml)
+- [对应版本静态 token 认证](https://github.com/hyperdxio/hyperdx/blob/821c2f93357b47d5ff932ea99d2adf93289815a5/docker/otel-collector/config.standalone.auth.yaml)
+- [OpenTelemetry 网关部署](https://opentelemetry.io/docs/collector/deploy/gateway/)

@@ -1,10 +1,12 @@
 # ClickHouse 存储配置
 
-`config.d/observability.xml` 管理 ClickHouse 自身的文本日志、诊断表和内部 `9363/metrics` 指标入口。官方镜像的主配置继续生效，业务遥测表由 ClickStack Collector 创建；`retention.sql` 管理实际分类型保留规则。
+`config.d/observability.xml` 管理 ClickHouse 自身的文本日志、诊断表和内部 `9363/metrics` 指标入口。官方镜像的主配置继续生效，业务遥测表由独立模式的 ClickStack Collector 导出器创建；`retention.sql` 是可选的分类型保留策略，不会被 Compose 自动执行。
 
 ## 数据和账号
 
-Compose 初始化 `otel` 数据库及 `observability` 用户，密码来自 `.env`。当前本地起步配置让 UI 和 Collector 共用此用户；供多服务长期使用前，再拆分写入、查询和运维权限。
+Compose 初始化 `otel` 数据库及 `observability` 用户，密码来自 `.env`。当前起步配置让 UI 和 Collector 共用此用户；供多服务长期使用前，再拆分写入、查询和运维权限。Collector 使用 `CLICKHOUSE_PASSWORD` 连接数据库，业务发送端则使用预先配置的 `OTLP_AUTH_TOKEN` 访问 Collector，两者用途不同。
+
+ClickHouse 端口不发布给业务机器。中心 Collector 使用 Compose 内部的 `clickhouse:9000` 写入，HyperDX 使用 `http://clickhouse:8123` 查询；远端 Go/Python 仅需连接中心的 OTLP 入口。HyperDX 的账号注册和团队采集密钥不再控制本项目的采集管道。
 
 默认采用官方 legacy/Map 表结构，以匹配 Compose 中的数据源定义：
 
@@ -16,9 +18,9 @@ Compose 初始化 `otel` 数据库及 `observability` 用户，密码来自 `.en
 
 ## 保留期限
 
-2.43.1 的 legacy/OpAMP 路径只读取统一的 `HYPERDX_OTEL_EXPORTER_TABLES_TTL`。Compose 从 `.env` 的 `TABLES_RETENTION=720h` 注入该参数；原先的分信号环境变量在此路径中不生效，已移除。
+Compose 将 `.env` 的 `TABLES_RETENTION`（默认 `720h = 30 天`）传入 `HYPERDX_OTEL_EXPORTER_TABLES_TTL`。当前镜像 standalone 配置原本把导出器 TTL 写死为 `720h`，本项目在 `collector/custom.yaml` 中为 `clickhouse` 和 `clickhouse/rrweb` 两个导出器显式覆盖为上述环境变量，因而可以继续用一个部署参数管理新表的统一默认期限。
 
-`retention.sql` 根据本机实际建表结构设置以下策略，已经执行并通过 `system.tables.create_table_query` 核验：
+新环境接受统一默认期限时，不必执行 `retention.sql`。如果希望日志和 Span 保存 7 天、指标保存 30 天，可在对应表已经创建后，手动执行此文件：
 
 | 表 | 保留规则 |
 | --- | --- |
@@ -27,9 +29,11 @@ Compose 初始化 `otel` 数据库及 `observability` 用户，密码来自 `.en
 | `otel_traces_trace_id_ts` | `Start` 起 7 天，与主 Span 表一致 |
 | 五类 `otel_metrics_*` 表 | `TimeUnix` 起 30 天 |
 
-`otel_traces_trace_id_ts_mv` 是不独立存储数据的物化视图，TTL 设置在其目标索引表上。Session 表仍使用统一默认 30 天，本项目尚未接入 Session 数据。
+`otel_traces_trace_id_ts_mv` 是不独立存储数据的物化视图，TTL 设置在其目标索引表上。Session 表继续使用统一建表默认期限，本项目尚未接入 Session 数据。
 
-新环境先启动 Collector 完成建表，再按根 README 执行 `retention.sql`。此文件适用于当前固定版本的表结构，未来升级或修改期限时，应先检查实际建表语句和关联表，不要无条件套用。修改 `.env` 不会迁移已有表。
+SQL 执行后，TTL 存入数据库表定义，并随 `.data/clickhouse/` 持久化。后续过期清理由 ClickHouse 执行，不需要每天或每次重启重复运行 SQL 文件。仅编辑文件或修改 `.env` 不会迁移已有表；已有表曾设为 7 天时，不再执行该文件也不会自动恢复 30 天。恢复或调整需显式执行相应 `ALTER TABLE ... MODIFY TTL`。
+
+可选 SQL 的执行方式见根 README，执行前应确认所需表已存在及目标保留期限。文件适用于当前固定版本的 legacy/Map 表结构，升级或修改期限时需先检查实际建表语句和关联表。实际生效值以 `SHOW CREATE TABLE otel.otel_logs` 等返回的 TTL 为准；本轮配置改动没有连接数据库读取或修改实际 TTL。
 
 ClickHouse 自身的文本日志设置为 warning 级别并轮转；配置中列出的系统诊断表使用 3 天或 7 天 TTL。它们仍可能在后台清理前占用额外空间，新增诊断表也要纳入检查。
 

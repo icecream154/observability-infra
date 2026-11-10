@@ -1,4 +1,8 @@
-# 1. 本地单机 ClickStack。仅使用公开镜像，不编译或修改 ClickStack 源码。
+# 1. 单台中心服务器上的可观测基础设施：独立 Collector + ClickHouse + HyperDX + MongoDB。
+# 多台 Go/Python 业务机器通过 OTLP 汇聚到这里；中心组件仍由这一份 Compose 管理。
+# Collector 使用预配置采集密钥，启动和接收数据不依赖 HyperDX 注册账号或 OpAMP。
+# 本地 Demo 和真实服务器共用这份文件；部署地址、访问 URL、密钥和资源额度通过 .env 配置。
+# 仅使用公开固定版本镜像，不编译或修改上游源码。
 # 以 # 开头的行是说明文字，不参与运行；是否编译镜像由 image/build 等实际配置决定。
 # name 设置整套 Compose 的默认项目名，将相关容器、默认网络等资源归为同一组。
 # 例如 clickhouse 服务的首个容器通常名为 observability-infra-clickhouse-1：
@@ -88,7 +92,7 @@ services:
       - ./.data/clickhouse-logs:/var/log/clickhouse-server
       # 将单个 XML 配置片段挂入 config.d，启动时与镜像原有主配置合并，不替换整个主配置目录。
       # 此片段管理自身文本日志、内部 9363/metrics 入口及若干 system 诊断表的 TTL。
-      # 业务遥测表的 TTL 在 clickhouse/retention.sql 中另行管理。
+      # 业务新表采用 Collector 的统一默认 TTL；需要分类型期限时可显式执行 clickhouse/retention.sql。
       # :ro 表示容器只能读取此挂载文件，不能通过它写回宿主机；宿主机仍可编辑源文件。
       - ./clickhouse/config.d/observability.xml:/etc/clickhouse-server/config.d/observability.xml:ro
     # healthcheck 在此容器内部执行探测，为“进程在运行”之外再提供数据库是否可响应的状态。
@@ -177,7 +181,7 @@ services:
     # 只管理容器 stdout/stderr 的日志副本，不限制 /data/db 中数据库文件的大小。
     logging: *container-logging
 
-  # 5. UI/API 提供查询和账号管理，并通过 OpAMP 为官方 Collector 提供接收配置。
+  # 5. HyperDX UI/API 提供查询、账号和看板管理，不再负责中心 Collector 的配置或采集认证。
   # app 是 HyperDX 平台服务：同一个容器运行 Next.js 前端、Express API 和告警检查后台任务。
   # 平台向 ClickHouse 查询遥测明细，向 MongoDB 保存账号、会话、连接、数据源及看板等平台状态。
   # 本服务没有单独挂载数据目录，因为主要持久化内容由上述两个数据库服务保存。
@@ -197,12 +201,14 @@ services:
         condition: service_healthy
       mongodb:
         condition: service_healthy
-    # 格式：宿主机监听地址:宿主机端口:容器内端口；这里仅在电脑的 127.0.0.1 发布入口。
-    # 默认前端为 localhost:18080，API 为 localhost:18001；其他电脑不能直接通过局域网 IP 访问。
+    # 格式：宿主机监听地址:宿主机端口:容器内端口；前端默认发布到 0.0.0.0，支持其他电脑访问。
+    # HYPERDX_BIND_ADDRESS 可改为服务器某个内网 IP；若使用本机 Nginx，可改为 127.0.0.1。
+    # 普通网页通过前端同源 /api 代理访问 API，因此仅前端需要远程入口，API 调试端口仍限制在本机。
     # 左右端口采用同一个变量，而下面的 environment 让程序监听对应的容器内端口。
-    # ports 负责转发，程序端口参数负责监听；修改时要保持匹配。这里的 127.0.0.1 是宿主机地址。
+    # ports 负责转发，程序端口参数负责监听；修改时要保持匹配。
+    # 直接访问 HTTP 无需 Nginx；HTTPS 由可选 Nginx/Caddy/云负载均衡器终止 TLS，见 operations/remote-access.md。
     ports:
-      - "127.0.0.1:${HYPERDX_APP_PORT:-18080}:${HYPERDX_APP_PORT:-18080}"
+      - "${HYPERDX_BIND_ADDRESS:-0.0.0.0}:${HYPERDX_APP_PORT:-18080}:${HYPERDX_APP_PORT:-18080}"
       - "127.0.0.1:${HYPERDX_API_PORT:-18001}:${HYPERDX_API_PORT:-18001}"
     # environment 将指定变量传入容器进程；.env 只是 Compose 进行 ${...} 替换的取值来源之一。
     # Docker 创建容器环境，容器内 Node.js 进程通过 process.env 读取，类似 Go 的 os.Getenv。
@@ -215,23 +221,25 @@ services:
       HYPERDX_APP_PORT: ${HYPERDX_APP_PORT:-18080}
       # 镜像入口脚本将此值传为 API 进程的 PORT，默认监听容器内 18001。
       HYPERDX_API_PORT: ${HYPERDX_API_PORT:-18001}
-      # 前端地址的基础部分，供入口脚本在没有 FRONTEND_URL 时拼接默认完整地址。
-      # 当前已显式提供 FRONTEND_URL，因此主要使用下一项；此 URL 不决定程序监听的网卡。
-      HYPERDX_APP_URL: http://localhost
+      # 容器内部前端监听所有网卡，以便 Docker 端口映射/代理能连接；不代表浏览器访问地址。
+      HYPERDX_APP_LISTEN_HOSTNAME: "0.0.0.0"
       # 浏览器访问的完整前端地址，API 用它处理跨域、Cookie 域/secure、登录跳转、邀请和告警链接。
-      # 这里的 localhost 指浏览器所在电脑，所以当前配置面向本机访问；远程部署需同步调整这些 URL。
-      FRONTEND_URL: http://localhost:${HYPERDX_APP_PORT:-18080}
+      # Demo 默认 http://localhost:18080；真实部署须将 HYPERDX_PUBLIC_URL 设为浏览器实际使用的完整 origin，
+      # 包括协议、IP/域名和必要端口，例如 http://服务器IP:18080 或 https://你的域名；不带子路径。
+      # 该值不是监听地址；设置 https URL 也不会自动生成证书或为容器开启 HTTPS。
+      # 已显式提供 FRONTEND_URL，不再依赖 HYPERDX_APP_URL 的后备拼接。
+      FRONTEND_URL: ${HYPERDX_PUBLIC_URL:-http://localhost:18080}
       # Next.js 服务端的 /api/* 请求代理目标，不是要求浏览器直接使用的 API 公共地址。
       # 浏览器请求 localhost:18080/api/...，由容器内前端转发到 localhost:18001/...。
       # 此处 localhost 指 app 容器自身；因为前端和 API 位于同一容器，才能这样连接。
-      SERVER_URL: http://localhost:${HYPERDX_API_PORT:-18001}
+      SERVER_URL: http://127.0.0.1:${HYPERDX_API_PORT:-18001}
       # MongoDB 连接：mongodb 是另一容器的服务名，27017 是端口，hyperdx 是应用数据库。
       # 当前未启用 MongoDB 认证；若以后启用，需要同步更新此连接 URI 的凭据和认证来源。
       MONGO_URI: mongodb://mongodb:27017/hyperdx
-      # OpAMP 管理服务端口，Collector 通过 app:4320 获取接收器等采集配置；不是业务 OTLP 入口。
+      # HyperDX 镜像自身仍会启动内部 OpAMP 服务；独立 Collector 不使用它，不需要发布此端口。
       # 2.43.1 入口脚本实际执行 OPAMP_PORT=${HYPERDX_OPAMP_PORT:-4320}，当前默认值刚好一致。
-      # Docker 健康检查是独立进程，不继承入口脚本后来 export 的值；这里显式提供 4320 供检查读取。
-      # 改端口需协调 HYPERDX_OPAMP_PORT、健康检查可见的 OPAMP_PORT 和 Collector 的 OPAMP_SERVER_URL。
+      # 这里保留镜像内部默认值，app 健康检查只检查 API 和前端，不再检查 OpAMP。
+      # 若以后单独使用 HyperDX 的 OpAMP 能力，再按镜像入口约定配置；本部署的采集链路不依赖它。
       OPAMP_PORT: "4320"
       # 登录会话签名密钥：登录后会话保存在 MongoDB，浏览器 Cookie 携带会话 ID 及其签名；
       # 服务器用此密钥校验签名，再查找会话确认登录身份，帮助发现会话标识被篡改。
@@ -248,6 +256,9 @@ services:
       # 平台自身服务端 OTel 遥测的导出目标；collector 为同网服务名，4318 为 OTLP HTTP 端口。
       # 该变量声明导出目的地，成功导出仍依赖 SDK 和采集认证等配置；它不是 app 的业务数据接收端口。
       OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+      # 平台自身遥测同样使用独立 Collector 的预配置凭据；不使用 UI 中创建的团队 Ingestion key。
+      # 此处只设置标准 OTLP 导出头，不启用 HYPERDX_API_KEY 所控制的其他平台日志传输。
+      OTEL_EXPORTER_OTLP_HEADERS: authorization=${OTLP_AUTH_TOKEN:?请先在 .env 中预配置 OTLP_AUTH_TOKEN}
       # 5.1. 初始化查询连接：告诉平台去哪里查询 ClickHouse，不负责采集、写入或创建业务表。
       # >- 是 YAML 折叠块字符串写法，去掉末尾换行；环境变量得到 JSON 字符串，由应用解析。
       # name 为连接名称，后面的数据源通过 connection 引用；host 为 app 可访问的 HTTP 查询接口。
@@ -290,19 +301,19 @@ services:
           {"name":"Traces","kind":"trace","connection":"Local ClickHouse","from":{"databaseName":"otel","tableName":"otel_traces"},"timestampValueExpression":"Timestamp","displayedTimestampValueExpression":"Timestamp","implicitColumnExpression":"SpanName","serviceNameExpression":"ServiceName","eventAttributesExpression":"SpanAttributes","resourceAttributesExpression":"ResourceAttributes","traceIdExpression":"TraceId","spanIdExpression":"SpanId","parentSpanIdExpression":"ParentSpanId","spanNameExpression":"SpanName","spanKindExpression":"SpanKind","durationExpression":"Duration","durationPrecision":9,"statusCodeExpression":"StatusCode","statusMessageExpression":"StatusMessage","spanEventsValueExpression":"Events","spanLinksValueExpression":"Links","defaultTableSelectExpression":"Timestamp,ServiceName,StatusCode,round(Duration/1e6),SpanName","logSourceId":"Logs","metricSourceId":"Metrics"},
           {"name":"Metrics","kind":"metric","connection":"Local ClickHouse","from":{"databaseName":"otel","tableName":""},"timestampValueExpression":"TimeUnix","resourceAttributesExpression":"ResourceAttributes","metricTables":{"gauge":"otel_metrics_gauge","histogram":"otel_metrics_histogram","sum":"otel_metrics_sum","summary":"otel_metrics_summary","exponential histogram":"otel_metrics_exponential_histogram"},"logSourceId":"Logs"}
         ]
-    # 5.3. 覆盖镜像硬编码 8000 的检查，同时验证当前端口的 API、前端与 OpAMP。
+    # 5.3. 覆盖镜像硬编码 8000 的检查，验证当前端口的 API 和前端；采集不再依赖 OpAMP 就绪状态。
     # 在 app 容器内部执行，故这里的 127.0.0.1 指本容器；不依赖宿主机的 ports 转发。
     healthcheck:
       # CMD 直接启动 node，-e 执行 JavaScript；process.env 读取创建容器时传入的环境变量。
-      # Promise.all 并发请求 API 的 /ready、前端的 / 和 OpAMP 的 /ready。
-      # 按默认值分别为 18001/ready、18080/、4320/ready；每个 fetch 最多等待 3000 毫秒。
+      # Promise.all 并发请求 API 的 /ready 和前端的 /。
+      # 按默认值分别为 18001/ready、18080/；每个 fetch 最多等待 3000 毫秒。
       # 所有响应 r.ok（HTTP 200~299）才退出 0；任一非成功状态、连接失败或超时则退出 1。
       # 就绪检查涵盖平台入口及其就绪条件，不证明业务遥测已成功接收、落库并可关联查询。
       test:
         - CMD
         - node
         - -e
-        - "Promise.all([process.env.HYPERDX_API_PORT + '/ready', process.env.HYPERDX_APP_PORT + '/', process.env.OPAMP_PORT + '/ready'].map(p => fetch('http://127.0.0.1:' + p, {signal: AbortSignal.timeout(3000)}))).then(rs => process.exit(rs.every(r => r.ok) ? 0 : 1)).catch(() => process.exit(1))"
+        - "Promise.all([process.env.HYPERDX_API_PORT + '/ready', process.env.HYPERDX_APP_PORT + '/'].map(p => fetch('http://127.0.0.1:' + p, {signal: AbortSignal.timeout(3000)}))).then(rs => process.exit(rs.every(r => r.ok) ? 0 : 1)).catch(() => process.exit(1))"
       # 正常阶段每次探测完成后间隔 10 秒再检查。
       interval: 10s
       # 整次检查最多运行 5 秒；这是 Docker 层上限，独立于上面的单请求 3 秒超时。
@@ -315,44 +326,54 @@ services:
     # 复用顶部 local 日志轮转规则，不限制 MongoDB 平台配置或 ClickHouse 遥测明细的大小。
     logging: *container-logging
 
-  # 6. 中心 Collector 通过 OTLP 接收数据，使用平台下发的采集认证和内置导出流程。
+  # 6. 独立中心 Collector：由本地配置和预配置密钥提供接收、认证及导出，不依赖 HyperDX 控制面。
   # 本服务作为遥测网关：业务服务 SDK / 客户端采集器 -> OTLP 接收器 -> 处理器 -> ClickHouse 导出器。
-  # 业务遥测直接写入 ClickHouse；app/MongoDB 提供团队、采集密钥和管理配置，不中转这些明细。
+  # 业务遥测直接写入 ClickHouse；app/MongoDB 仅负责查询展示及平台状态，不中转或授权这些明细。
   # 数据通路为发送端 -> collector:4317/4318 -> clickhouse:9000；
-  # 管理通路为 Collector -> app:4320，通过 OpAMP 获取配置，两者用途不同。
+  # 所有业务机器共用可达的中心采集入口，通过 service.name、service.instance.id、环境属性区分来源。
+  # 远端发送地址使用中心服务器的内网 IP/域名；collector、clickhouse 等服务名仅用于本 Compose 内部。
   # 当前没有挂载电脑业务日志目录或 Docker socket，不会自动读取 Go 项目终端输出。
   # 需要在业务 SDK 配置导出，或由客户端 Collector 等采集后主动上传。
   collector:
-    # 默认运行 ClickStack 定制 Collector 2.43.1，包含所需 OTel 组件和 OpAMP Supervisor。
-    # CLICKSTACK_COLLECTOR_IMAGE 可以覆盖完整镜像地址；这里仍使用依赖 HyperDX 管理配置的部署方式。
+    # 保留固定版本以沿用现有 OTel 组件、日志转换和 legacy 表结构，但通过空 OPAMP_SERVER_URL 选择 standalone。
+    # 该模式直接运行 Collector，不启动 OpAMP Supervisor；无需先注册 HyperDX 账号即可接收数据。
+    # CLICKSTACK_COLLECTOR_IMAGE 可以覆盖完整镜像地址；更换成普通 Contrib 镜像前需另外提供完整配置。
     image: ${CLICKSTACK_COLLECTOR_IMAGE:-hyperdx/hyperdx-otel-collector:2.43.1}
     # 容器主进程退出后尝试恢复，人为 stop 后保持停止；删除后不会自动重新创建。
     # 单独出现 unhealthy 健康状态不会直接触发此重启策略。
     restart: unless-stopped
-    # 整个容器默认内存上限 1 GiB，由 Collector、Supervisor 等共享，可由同名变量覆盖。
+    # 整个容器默认内存上限 1 GiB，可由同名变量覆盖；独立模式中不再有 Supervisor 进程。
     # collector/custom.yaml 另设 Go 堆内存保护：软阈值 640 MiB、硬阈值 768 MiB，为其他开销留空间。
     # 内部阈值不等于容器强制上限；调整容器额度时需同时核对该文件的固定数值和批次大小。
     mem_limit: ${COLLECTOR_MEMORY_LIMIT:-1g}
-    # 启动前等待 ClickHouse 可响应，以及 app 的 API、前端和 OpAMP 达到健康条件。
-    # ClickHouse 是写入目标，app 是远程采集配置来源；运行中失联仍需各组件自行恢复连接和重试。
-    # 此启动依赖不保证平台已创建团队/采集密钥，也不保证业务数据已经进入数据库。
+    # 只等待写入目标 ClickHouse 健康，不等待 app 或 MongoDB；展示平台初始化与采集启动可以分别进行。
+    # 运行中数据库失联仍需导出器重试；健康依赖不代表已经有业务数据写入。
     depends_on:
       clickhouse:
         condition: service_healthy
-      app:
-        condition: service_healthy
-    # 格式：宿主机监听地址:宿主机端口:容器端口。127.0.0.1 将发布入口限定为本机。
+    # 格式：宿主机监听地址:宿主机端口:容器端口；默认 0.0.0.0，使多台业务机器可访问中心。
+    # OTLP_BIND_ADDRESS 可设为特定内网 IP；若所有外部请求经本机 HTTPS 代理，则可收紧为 127.0.0.1。
+    # 实际网络还需服务器路由和防火墙允许；公网传输应使用 TLS 入口，见 operations/remote-access.md。
     # 左侧宿主机端口可由变量覆盖，右侧容器端口固定；改宿主机端口不需要同时改容器监听端口。
     # 同网容器可直接使用 collector:4317/4318，电脑上的发送端使用 localhost 和发布端口。
     ports:
       # OTLP gRPC 接收入口，日志、Span、指标都可以通过此协议发送。
-      - "127.0.0.1:${OTLP_GRPC_PORT:-4317}:4317"
+      - "${OTLP_BIND_ADDRESS:-0.0.0.0}:${OTLP_GRPC_PORT:-4317}:4317"
       # OTLP HTTP 接收入口，同样支持三类信号；路径分别为 /v1/logs、/v1/traces、/v1/metrics。
       # 4317 与 4318 区分传输协议，不是分别分配给日志和 Trace。
-      - "127.0.0.1:${OTLP_HTTP_PORT:-4318}:4318"
-    # 以下变量传入容器，供镜像入口脚本、Supervisor 和最终 Collector 配置读取。
+      - "${OTLP_BIND_ADDRESS:-0.0.0.0}:${OTLP_HTTP_PORT:-4318}:4318"
+    # 以下变量传入容器，供镜像入口脚本和最终 Collector 配置读取。
     # .env 提供 Compose 替换值，environment 决定传入哪些变量；变量命名和用途由当前镜像约定。
     environment:
+      # 显式清空以选择 standalone；启动时按顺序合并内置基础、独立管道、静态认证和 custom.yaml。
+      # 不从 app 获取动态配置，也不因 HyperDX 团队密钥或 UI 状态改变接收能力。
+      OPAMP_SERVER_URL: ""
+      # 部署前生成并保存的共享采集凭据，双方约定即可，不需要先登录 HyperDX 取得。
+      # 非空时镜像自动加载静态 bearer-token 认证，并同时保护 OTLP HTTP 和 gRPC 接收器。
+      # 业务 SDK/Agent 通过 authorization 请求头或 gRPC metadata 发送相同 token；接受裸 token/Bearer token。
+      # 使用独立随机十六进制字符串，避免特殊字符影响标准 OTLP headers 配置；空值阻止 Compose 启动。
+      # 此值不会因普通重启重置；轮换时需更新 Collector 和所有发送端。UI 中的团队 Ingestion key 不参与验证。
+      OTLP_AUTH_TOKEN: ${OTLP_AUTH_TOKEN:?请先在 .env 中预配置 OTLP_AUTH_TOKEN}
       # 使用原生 TCP 协议向 ClickHouse 写入；clickhouse 是同网服务名，9000 是原生协议端口。
       # dial_timeout=10s 是建立连接最多等待 10 秒，不是批处理间隔、统一 SQL 超时或数据保留时间。
       # app 的查询连接使用 http://clickhouse:8123；这里的导出连接与之分别配置。
@@ -360,7 +381,7 @@ services:
       # Collector 的数据库账号，当前与 app 共用 observability；需要对应的建表、写入权限。
       CLICKHOUSE_USER: observability
       # 写数据库的密码，由 shell 环境或 .env 提供；未设置或为空时，Compose 通过 :? 直接报错。
-      # 这是 Collector -> ClickHouse 的凭据，不是业务发送端上传时使用的 Ingestion API Key。
+      # 这是 Collector -> ClickHouse 的凭据；业务发送端使用上面的 OTLP_AUTH_TOKEN，不获得数据库密码。
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请先在 .env 中填写 ClickHouse 密码}
       # 指定业务遥测表所在数据库；数据持久化由 clickhouse 服务的 .data/clickhouse/ 挂载负责。
       HYPERDX_OTEL_EXPORTER_CLICKHOUSE_DATABASE: otel
@@ -370,7 +391,7 @@ services:
       # 已有表继续使用其实际定义，表结构和保留规则的后续调整需要显式数据库变更。
       HYPERDX_OTEL_EXPORTER_CREATE_LEGACY_SCHEMA: "true"
       # 6.1. 新建表的统一默认 TTL（数据保留期限），默认 720 小时 = 30 天，可由 TABLES_RETENTION 覆盖。
-      # 当前 2.43.1 legacy/OpAMP 路径读取这一项，不读取原先的分信号 TTL 环境变量。
+      # 2.43.1 standalone 内置导出器原本写死 720h；custom.yaml 显式覆盖两个导出器的 ttl，使此项实际生效。
       # 每条记录根据对应时间列计算到期时间，实际清理由 ClickHouse 后台合并执行，不能当作磁盘硬配额。
       # 新环境接受日志、Span、指标统一保留 30 天时，可以不执行 clickhouse/retention.sql。
       # 该 SQL 是可选的分类型策略：在表创建后，将日志/Span/TraceId 时间索引设为 7 天、指标设为 30 天。
@@ -382,21 +403,17 @@ services:
       # 如需恢复，仍应显式执行相应 ALTER SQL，并用 SHOW CREATE TABLE 查看实际表定义确认。
       HYPERDX_OTEL_EXPORTER_TABLES_TTL: ${TABLES_RETENTION:-720h}
       # ClickHouse 自身的 Prometheus 指标抓取目标，与 9000 写入端口、8123 查询端口分别有不同用途。
-      # 由 clickhouse/config.d/observability.xml 开启；当前管道默认每 30 秒抓取 clickhouse:9363/metrics。
+      # 由 clickhouse/config.d/observability.xml 开启；custom.yaml 定义独立 receiver，每 30 秒抓取 /metrics。
       # 这用于观察数据库运行情况，不会自动发现或抓取 Go 业务服务的指标。
-      CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT: clickhouse:9363
+      # 不使用旧名 CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT：该镜像 standalone 下会据其启用 remote-write，
+      # 而当前 9363 是只供抓取的指标端口，不是接收 /write 的入口。
+      CLICKHOUSE_METRICS_TARGET: clickhouse:9363
       # Collector 自身的运行日志详细程度，不会把所有接入业务日志统一过滤成 info 级别。
       HYPERDX_LOG_LEVEL: info
-      # 非空时启用 OpAMP Supervisor 模式，最终向 http://app:4320/v1/opamp 请求远程配置。
-      # 平台从 MongoDB 读取团队/API Key 等管理信息，下发接收器、采集认证和导出配置。
-      # 默认认证模式下，业务发送端需携带平台生成的 Ingestion API Key（authorization 请求头）。
-      # 采集密钥、app 的 EXPRESS_SESSION_SECRET、ClickHouse 密码分别保护上传、登录会话和数据库连接。
-      # 首次创建团队/账号并产生采集密钥前，OTLP 接收器可能尚未接入管道，但容器仍可显示 healthy。
-      # 所以发布了 4317/4318 或进程健康，不代表此时业务上传已可用；需带正确密钥验证接收和落库。
-      OPAMP_SERVER_URL: http://app:4320
       # 指定额外配置片段在容器内的位置，必须与下面 volumes 的右侧路径一致。
-      # 最终配置为“镜像内置配置 + custom.yaml + OpAMP 远程配置”，不以此文件完整替换内置配置。
-      # 当前片段只调整 memory_limiter/batch，保留接收器、认证、导出器等；不是独立 Collector 完整配置。
+      # 当前片段调整内存/批处理和 TTL，并加入数据库指标 receiver；HTTP/gRPC 接收认证由内置静态认证配置提供。
+      # 本文件不覆盖 service.extensions，保留 health_check 和 bearertokenauth/hyperdx，避免合并时丢失认证。
+      # 它仍是依赖当前镜像基础和 standalone 配置的片段，不是普通 Collector 的完整配置。
       CUSTOM_OTELCOL_CONFIG_FILE: /etc/otelcol-contrib/custom.yaml
     # 这里只挂载项目配置片段；没有挂载业务日志目录或持久化发送队列目录。
     volumes:

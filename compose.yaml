@@ -178,35 +178,112 @@ services:
     logging: *container-logging
 
   # 5. UI/API 提供查询和账号管理，并通过 OpAMP 为官方 Collector 提供接收配置。
+  # app 是 HyperDX 平台服务：同一个容器运行 Next.js 前端、Express API 和告警检查后台任务。
+  # 平台向 ClickHouse 查询遥测明细，向 MongoDB 保存账号、会话、连接、数据源及看板等平台状态。
+  # 本服务没有单独挂载数据目录，因为主要持久化内容由上述两个数据库服务保存。
   app:
+    # 运行现成的 HyperDX 2.43.1 镜像；CLICKSTACK_APP_IMAGE 非空时可覆盖整个镜像地址和标签。
     image: ${CLICKSTACK_APP_IMAGE:-hyperdx/hyperdx:2.43.1}
+    # 容器主进程退出后尝试恢复，人为停止后保持停止；仅 unhealthy 不会自动触发此策略。
     restart: unless-stopped
+    # 默认整个 app 容器最多使用 2 GiB，由前端、API 和后台任务共享；可用同名环境变量覆盖。
+    # 这不是每个进程各有 2 GiB，也不包含其他数据库容器的内存额度。
     mem_limit: ${CLICKSTACK_APP_MEMORY_LIMIT:-2g}
+    # 启动 app 前等待两个数据库的健康检查成功，减少刚启动就连接尚未就绪数据库的问题。
+    # 这是启动依赖，不代表运行期间数据库失联时会自动停止或重启 app。
+    # 数据库 healthy 也不保证业务表、平台账号和整条采集链路都已完成初始化。
     depends_on:
       clickhouse:
         condition: service_healthy
       mongodb:
         condition: service_healthy
+    # 格式：宿主机监听地址:宿主机端口:容器内端口；这里仅在电脑的 127.0.0.1 发布入口。
+    # 默认前端为 localhost:18080，API 为 localhost:18001；其他电脑不能直接通过局域网 IP 访问。
+    # 左右端口采用同一个变量，而下面的 environment 让程序监听对应的容器内端口。
+    # ports 负责转发，程序端口参数负责监听；修改时要保持匹配。这里的 127.0.0.1 是宿主机地址。
     ports:
       - "127.0.0.1:${HYPERDX_APP_PORT:-18080}:${HYPERDX_APP_PORT:-18080}"
       - "127.0.0.1:${HYPERDX_API_PORT:-18001}:${HYPERDX_API_PORT:-18001}"
+    # environment 将指定变量传入容器进程；.env 只是 Compose 进行 ${...} 替换的取值来源之一。
+    # Docker 创建容器环境，容器内 Node.js 进程通过 process.env 读取，类似 Go 的 os.Getenv。
+    # Node.js 在这里不是自动读取电脑上的 .env；仅在 .env 新增变量，不代表自动传入容器。
+    # 例如未提供 HYPERDX_API_PORT 时，默认值 18001 仍会传入，process.env 读到字符串 "18001"。
+    # 修改端口、日志级别、会话密钥等运行参数后，用 docker compose up -d app 应用配置变化；
+    # 单纯 docker compose restart app 不会将新的 Compose 环境变量注入已有容器。
     environment:
+      # 镜像入口脚本将此值传为前端进程的 PORT，默认监听容器内 18080。
       HYPERDX_APP_PORT: ${HYPERDX_APP_PORT:-18080}
+      # 镜像入口脚本将此值传为 API 进程的 PORT，默认监听容器内 18001。
       HYPERDX_API_PORT: ${HYPERDX_API_PORT:-18001}
+      # 前端地址的基础部分，供入口脚本在没有 FRONTEND_URL 时拼接默认完整地址。
+      # 当前已显式提供 FRONTEND_URL，因此主要使用下一项；此 URL 不决定程序监听的网卡。
       HYPERDX_APP_URL: http://localhost
+      # 浏览器访问的完整前端地址，API 用它处理跨域、Cookie 域/secure、登录跳转、邀请和告警链接。
+      # 这里的 localhost 指浏览器所在电脑，所以当前配置面向本机访问；远程部署需同步调整这些 URL。
       FRONTEND_URL: http://localhost:${HYPERDX_APP_PORT:-18080}
+      # Next.js 服务端的 /api/* 请求代理目标，不是要求浏览器直接使用的 API 公共地址。
+      # 浏览器请求 localhost:18080/api/...，由容器内前端转发到 localhost:18001/...。
+      # 此处 localhost 指 app 容器自身；因为前端和 API 位于同一容器，才能这样连接。
       SERVER_URL: http://localhost:${HYPERDX_API_PORT:-18001}
+      # MongoDB 连接：mongodb 是另一容器的服务名，27017 是端口，hyperdx 是应用数据库。
+      # 当前未启用 MongoDB 认证；若以后启用，需要同步更新此连接 URI 的凭据和认证来源。
       MONGO_URI: mongodb://mongodb:27017/hyperdx
+      # OpAMP 管理服务端口，Collector 通过 app:4320 获取接收器等采集配置；不是业务 OTLP 入口。
+      # 2.43.1 入口脚本实际执行 OPAMP_PORT=${HYPERDX_OPAMP_PORT:-4320}，当前默认值刚好一致。
+      # Docker 健康检查是独立进程，不继承入口脚本后来 export 的值；这里显式提供 4320 供检查读取。
+      # 改端口需协调 HYPERDX_OPAMP_PORT、健康检查可见的 OPAMP_PORT 和 Collector 的 OPAMP_SERVER_URL。
       OPAMP_PORT: "4320"
+      # 登录会话签名密钥：登录后会话保存在 MongoDB，浏览器 Cookie 携带会话 ID 及其签名；
+      # 服务器用此密钥校验签名，再查找会话确认登录身份，帮助发现会话标识被篡改。
+      # 它与用户登录密码、数据库密码及数据库内容加密分别有不同用途，应使用随机值并保密、稳定保存。
+      # 普通重启继续使用同一个值；更换密钥通常导致用户重新登录，不会删除账号、看板和遥测数据。
+      # ${变量:?说明} 要求 Compose 能取得非空值，否则直接报错。
       EXPRESS_SESSION_SECRET: ${EXPRESS_SESSION_SECRET:?请先在 .env 中填写会话密钥}
+      # HyperDX 平台自身日志的详细程度；不改变接收到的业务日志的原始严重级别。
       HYPERDX_LOG_LEVEL: info
+      # 关闭产品使用情况统计；不关闭业务遥测接收，也不等同于关闭平台自身的 OTel 插桩。
       USAGE_STATS_ENABLED: "false"
+      # 平台自身遥测中的服务名；不会把接入的 Go 等业务服务统一改名为 clickstack-platform。
       OTEL_SERVICE_NAME: clickstack-platform
+      # 平台自身服务端 OTel 遥测的导出目标；collector 为同网服务名，4318 为 OTLP HTTP 端口。
+      # 该变量声明导出目的地，成功导出仍依赖 SDK 和采集认证等配置；它不是 app 的业务数据接收端口。
       OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
-      # 5.1. 密码要求使用十六进制字符串，避免将引号或换行插入下方 JSON。
+      # 5.1. 初始化查询连接：告诉平台去哪里查询 ClickHouse，不负责采集、写入或创建业务表。
+      # >- 是 YAML 折叠块字符串写法，去掉末尾换行；环境变量得到 JSON 字符串，由应用解析。
+      # name 为连接名称，后面的数据源通过 connection 引用；host 为 app 可访问的 HTTP 查询接口。
+      # username/password 是 ClickHouse 数据库凭据；与 Collector 的原生 TCP 9000 写入连接分别配置。
+      # 本项目约定密码使用十六进制字符串，避免直接插入 JSON 时引号或换行破坏格式；
+      # 这是本项目的格式约束，不是 ClickHouse 密码只能使用十六进制。
+      # DEFAULT_CONNECTIONS / DEFAULT_SOURCES 是新团队、空配置的初始化模板，不会自动覆盖已有配置。
+      # 日常更新：Team Settings -> Data -> Connections，编辑 Local ClickHouse，测试连接后保存。
+      # 配置保存在 MongoDB，通常不需要重启；修改这里的连接密码也不会替数据库账号修改密码。
+      # 如需让以后新环境获得相同初始配置，可同时维护本文件的默认模板。
       DEFAULT_CONNECTIONS: >-
         [{"name":"Local ClickHouse","host":"http://clickhouse:8123","username":"observability","password":"${CLICKHOUSE_PASSWORD:?请先在 .env 中填写 ClickHouse 密码}"}]
-      # 5.2. 使用官方表字段，明确日志与 Trace 的双向关联；配置在账号初始化时使用。
+      # 5.2. 初始化数据源：为 UI 定义库表、字段语义、默认展示和关联方式，配合当前官方表结构。
+      # connection 对应上述连接名；from.databaseName/tableName 指向要查询的库和表。
+      # 这些映射不采集或复制数据，不执行 CREATE/ALTER TABLE；实际业务表由 Collector 流程创建。
+      # 通用字段：
+      #   timestampValueExpression：时间筛选等查询使用的时间列/表达式。
+      #   displayedTimestampValueExpression：页面展示使用的时间列，可使用更高精度；此处同为 Timestamp。
+      #   implicitColumnExpression：不指定字段时默认全文搜索的列，日志为 Body，Trace 为 SpanName。
+      #   bodyExpression / serviceNameExpression：日志正文 / 服务名。
+      #   eventAttributesExpression：事件级属性，分别为 LogAttributes 或 SpanAttributes。
+      #   resourceAttributesExpression：服务、主机、实例等资源级属性。
+      #   severityTextExpression / severityNumberExpression：文本和数字形式的日志级别。
+      #   traceIdExpression / spanIdExpression：Trace 和 Span 标识，用于展示和关联。
+      #   defaultTableSelectExpression：默认结果列表选择的列及 SQL 表达式。
+      # Logs：查询 otel.otel_logs，正文为 Body，时间为 Timestamp，并配置跳转到 Traces / Metrics。
+      # Traces：查询 otel.otel_traces，ParentSpanId 组织父子关系，SpanName/SpanKind 表示操作名和角色；
+      #   Duration 为耗时，durationPrecision=9 表示纳秒，列表的 round(Duration/1e6) 换算为整数毫秒；
+      #   StatusCode/StatusMessage 为状态，Events 为 Span 内事件，Links 为与其他 Span 的链接。
+      # Metrics：按 metricTables 在 gauge/sum/histogram/summary/exponential histogram 五类表之间选择；
+      #   因此 from.tableName 为空不是漏填，数据库仍为 otel，时间字段为 TimeUnix。
+      # traceSourceId/logSourceId/metricSourceId 在默认 JSON 中按数据源名称引用，创建时解析为实际 ID。
+      # 它们提供界面跳转关系；实际关联仍需要数据中有一致的 TraceId、服务名、资源属性和时间等。
+      # 已有数据源通过 Team Settings -> Data -> Sources 编辑 Logs/Traces/Metrics，再 Save Source。
+      # 修改映射通常无需重启，保存在 MongoDB；实际库表结构或 TTL 变化需另行在 ClickHouse 中处理。
+      # 不要在 >- 的 JSON 内容内部插入 YAML 注释：块字符串内的 # 会成为字符串内容，可能破坏 JSON。
       DEFAULT_SOURCES: >-
         [
           {"name":"Logs","kind":"log","connection":"Local ClickHouse","from":{"databaseName":"otel","tableName":"otel_logs"},"timestampValueExpression":"Timestamp","displayedTimestampValueExpression":"Timestamp","implicitColumnExpression":"Body","bodyExpression":"Body","serviceNameExpression":"ServiceName","eventAttributesExpression":"LogAttributes","resourceAttributesExpression":"ResourceAttributes","severityTextExpression":"SeverityText","severityNumberExpression":"SeverityNumber","traceIdExpression":"TraceId","spanIdExpression":"SpanId","defaultTableSelectExpression":"Timestamp,ServiceName,SeverityText,Body","traceSourceId":"Traces","metricSourceId":"Metrics"},
@@ -214,43 +291,122 @@ services:
           {"name":"Metrics","kind":"metric","connection":"Local ClickHouse","from":{"databaseName":"otel","tableName":""},"timestampValueExpression":"TimeUnix","resourceAttributesExpression":"ResourceAttributes","metricTables":{"gauge":"otel_metrics_gauge","histogram":"otel_metrics_histogram","sum":"otel_metrics_sum","summary":"otel_metrics_summary","exponential histogram":"otel_metrics_exponential_histogram"},"logSourceId":"Logs"}
         ]
     # 5.3. 覆盖镜像硬编码 8000 的检查，同时验证当前端口的 API、前端与 OpAMP。
+    # 在 app 容器内部执行，故这里的 127.0.0.1 指本容器；不依赖宿主机的 ports 转发。
     healthcheck:
+      # CMD 直接启动 node，-e 执行 JavaScript；process.env 读取创建容器时传入的环境变量。
+      # Promise.all 并发请求 API 的 /ready、前端的 / 和 OpAMP 的 /ready。
+      # 按默认值分别为 18001/ready、18080/、4320/ready；每个 fetch 最多等待 3000 毫秒。
+      # 所有响应 r.ok（HTTP 200~299）才退出 0；任一非成功状态、连接失败或超时则退出 1。
+      # 就绪检查涵盖平台入口及其就绪条件，不证明业务遥测已成功接收、落库并可关联查询。
       test:
         - CMD
         - node
         - -e
         - "Promise.all([process.env.HYPERDX_API_PORT + '/ready', process.env.HYPERDX_APP_PORT + '/', process.env.OPAMP_PORT + '/ready'].map(p => fetch('http://127.0.0.1:' + p, {signal: AbortSignal.timeout(3000)}))).then(rs => process.exit(rs.every(r => r.ok) ? 0 : 1)).catch(() => process.exit(1))"
+      # 正常阶段每次探测完成后间隔 10 秒再检查。
       interval: 10s
+      # 整次检查最多运行 5 秒；这是 Docker 层上限，独立于上面的单请求 3 秒超时。
       timeout: 5s
+      # 连续失败 6 次标记 unhealthy，成功清零失败计数；不会单凭此状态自动重启。
       retries: 6
+      # 20 秒启动宽限期，期间仍检查；尚未成功前的失败不计数，成功可提前变为 healthy。
       start_period: 20s
+    # HYPERDX_LOG_LEVEL 决定程序输出哪些级别，logging 决定 Docker 如何保存控制台输出。
+    # 复用顶部 local 日志轮转规则，不限制 MongoDB 平台配置或 ClickHouse 遥测明细的大小。
     logging: *container-logging
 
   # 6. 中心 Collector 通过 OTLP 接收数据，使用平台下发的采集认证和内置导出流程。
+  # 本服务作为遥测网关：业务服务 SDK / 客户端采集器 -> OTLP 接收器 -> 处理器 -> ClickHouse 导出器。
+  # 业务遥测直接写入 ClickHouse；app/MongoDB 提供团队、采集密钥和管理配置，不中转这些明细。
+  # 数据通路为发送端 -> collector:4317/4318 -> clickhouse:9000；
+  # 管理通路为 Collector -> app:4320，通过 OpAMP 获取配置，两者用途不同。
+  # 当前没有挂载电脑业务日志目录或 Docker socket，不会自动读取 Go 项目终端输出。
+  # 需要在业务 SDK 配置导出，或由客户端 Collector 等采集后主动上传。
   collector:
+    # 默认运行 ClickStack 定制 Collector 2.43.1，包含所需 OTel 组件和 OpAMP Supervisor。
+    # CLICKSTACK_COLLECTOR_IMAGE 可以覆盖完整镜像地址；这里仍使用依赖 HyperDX 管理配置的部署方式。
     image: ${CLICKSTACK_COLLECTOR_IMAGE:-hyperdx/hyperdx-otel-collector:2.43.1}
+    # 容器主进程退出后尝试恢复，人为 stop 后保持停止；删除后不会自动重新创建。
+    # 单独出现 unhealthy 健康状态不会直接触发此重启策略。
     restart: unless-stopped
+    # 整个容器默认内存上限 1 GiB，由 Collector、Supervisor 等共享，可由同名变量覆盖。
+    # collector/custom.yaml 另设 Go 堆内存保护：软阈值 640 MiB、硬阈值 768 MiB，为其他开销留空间。
+    # 内部阈值不等于容器强制上限；调整容器额度时需同时核对该文件的固定数值和批次大小。
     mem_limit: ${COLLECTOR_MEMORY_LIMIT:-1g}
+    # 启动前等待 ClickHouse 可响应，以及 app 的 API、前端和 OpAMP 达到健康条件。
+    # ClickHouse 是写入目标，app 是远程采集配置来源；运行中失联仍需各组件自行恢复连接和重试。
+    # 此启动依赖不保证平台已创建团队/采集密钥，也不保证业务数据已经进入数据库。
     depends_on:
       clickhouse:
         condition: service_healthy
       app:
         condition: service_healthy
+    # 格式：宿主机监听地址:宿主机端口:容器端口。127.0.0.1 将发布入口限定为本机。
+    # 左侧宿主机端口可由变量覆盖，右侧容器端口固定；改宿主机端口不需要同时改容器监听端口。
+    # 同网容器可直接使用 collector:4317/4318，电脑上的发送端使用 localhost 和发布端口。
     ports:
+      # OTLP gRPC 接收入口，日志、Span、指标都可以通过此协议发送。
       - "127.0.0.1:${OTLP_GRPC_PORT:-4317}:4317"
+      # OTLP HTTP 接收入口，同样支持三类信号；路径分别为 /v1/logs、/v1/traces、/v1/metrics。
+      # 4317 与 4318 区分传输协议，不是分别分配给日志和 Trace。
       - "127.0.0.1:${OTLP_HTTP_PORT:-4318}:4318"
+    # 以下变量传入容器，供镜像入口脚本、Supervisor 和最终 Collector 配置读取。
+    # .env 提供 Compose 替换值，environment 决定传入哪些变量；变量命名和用途由当前镜像约定。
     environment:
+      # 使用原生 TCP 协议向 ClickHouse 写入；clickhouse 是同网服务名，9000 是原生协议端口。
+      # dial_timeout=10s 是建立连接最多等待 10 秒，不是批处理间隔、统一 SQL 超时或数据保留时间。
+      # app 的查询连接使用 http://clickhouse:8123；这里的导出连接与之分别配置。
       CLICKHOUSE_ENDPOINT: tcp://clickhouse:9000?dial_timeout=10s
+      # Collector 的数据库账号，当前与 app 共用 observability；需要对应的建表、写入权限。
       CLICKHOUSE_USER: observability
+      # 写数据库的密码，由 shell 环境或 .env 提供；未设置或为空时，Compose 通过 :? 直接报错。
+      # 这是 Collector -> ClickHouse 的凭据，不是业务发送端上传时使用的 Ingestion API Key。
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请先在 .env 中填写 ClickHouse 密码}
+      # 指定业务遥测表所在数据库；数据持久化由 clickhouse 服务的 .data/clickhouse/ 挂载负责。
       HYPERDX_OTEL_EXPORTER_CLICKHOUSE_DATABASE: otel
+      # schema 指表名、列名、类型等表结构；true 选择当前版本兼容的 legacy 建表方案。
+      # 镜像跳过另一套独立 schema migration，改由导出器以 create_schema=true 创建所需表，
+      # 与 app 的 otel_logs / otel_traces / otel_metrics_* 字段映射配套；这不是关闭建表。
+      # 已有表继续使用其实际定义，表结构和保留规则的后续调整需要显式数据库变更。
       HYPERDX_OTEL_EXPORTER_CREATE_LEGACY_SCHEMA: "true"
-      # 6.1. 2.43.1 的 legacy/OpAMP 路径使用统一建表 TTL；分类型策略由 retention.sql 管理。
+      # 6.1. 新建表的统一默认 TTL（数据保留期限），默认 720 小时 = 30 天，可由 TABLES_RETENTION 覆盖。
+      # 当前 2.43.1 legacy/OpAMP 路径读取这一项，不读取原先的分信号 TTL 环境变量。
+      # 每条记录根据对应时间列计算到期时间，实际清理由 ClickHouse 后台合并执行，不能当作磁盘硬配额。
+      # 新环境接受日志、Span、指标统一保留 30 天时，可以不执行 clickhouse/retention.sql。
+      # 该 SQL 是可选的分类型策略：在表创建后，将日志/Span/TraceId 时间索引设为 7 天、指标设为 30 天。
+      # 当前 Compose 没有挂载或调用这个 SQL 文件；需要按 README 的命令显式交给数据库客户端执行。
+      # 执行 ALTER TABLE ... MODIFY TTL 后，规则保存在表定义中，随 ClickHouse 数据目录持久化；
+      # 后续由数据库持续清理，不需要每日或每次重启时重复执行 SQL 文件。
+      # 仅编辑 SQL 文件不会更新数据库；仅修改本环境变量也不会迁移已有表的 TTL。
+      # 已改为 7 天的表，不会因“不再执行 retention.sql”或重启 Collector 自动恢复为 30 天；
+      # 如需恢复，仍应显式执行相应 ALTER SQL，并用 SHOW CREATE TABLE 查看实际表定义确认。
       HYPERDX_OTEL_EXPORTER_TABLES_TTL: ${TABLES_RETENTION:-720h}
+      # ClickHouse 自身的 Prometheus 指标抓取目标，与 9000 写入端口、8123 查询端口分别有不同用途。
+      # 由 clickhouse/config.d/observability.xml 开启；当前管道默认每 30 秒抓取 clickhouse:9363/metrics。
+      # 这用于观察数据库运行情况，不会自动发现或抓取 Go 业务服务的指标。
       CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT: clickhouse:9363
+      # Collector 自身的运行日志详细程度，不会把所有接入业务日志统一过滤成 info 级别。
       HYPERDX_LOG_LEVEL: info
+      # 非空时启用 OpAMP Supervisor 模式，最终向 http://app:4320/v1/opamp 请求远程配置。
+      # 平台从 MongoDB 读取团队/API Key 等管理信息，下发接收器、采集认证和导出配置。
+      # 默认认证模式下，业务发送端需携带平台生成的 Ingestion API Key（authorization 请求头）。
+      # 采集密钥、app 的 EXPRESS_SESSION_SECRET、ClickHouse 密码分别保护上传、登录会话和数据库连接。
+      # 首次创建团队/账号并产生采集密钥前，OTLP 接收器可能尚未接入管道，但容器仍可显示 healthy。
+      # 所以发布了 4317/4318 或进程健康，不代表此时业务上传已可用；需带正确密钥验证接收和落库。
       OPAMP_SERVER_URL: http://app:4320
+      # 指定额外配置片段在容器内的位置，必须与下面 volumes 的右侧路径一致。
+      # 最终配置为“镜像内置配置 + custom.yaml + OpAMP 远程配置”，不以此文件完整替换内置配置。
+      # 当前片段只调整 memory_limiter/batch，保留接收器、认证、导出器等；不是独立 Collector 完整配置。
       CUSTOM_OTELCOL_CONFIG_FILE: /etc/otelcol-contrib/custom.yaml
+    # 这里只挂载项目配置片段；没有挂载业务日志目录或持久化发送队列目录。
     volumes:
+      # 左侧 ./ 相对于本 Compose 文件；右侧是镜像读取路径，:ro 限制容器写回宿主机源文件。
+      # 只改注释无需重启；以后修改实际处理器参数，可正常重启 collector 重新加载文件。
+      # 若同时修改环境变量或资源限制，应使用 docker compose up -d collector 应用容器配置变化。
       - ./collector/custom.yaml:/etc/otelcol-contrib/custom.yaml:ro
+    # 本段没有显式 healthcheck，默认继承 2.43.1 镜像自带的 wget http://localhost:13133/ 检查：
+    # interval=30s、timeout=5s、start_period=15s、retries=3。13133 未发布到宿主机，检查在容器内部执行。
+    # 该健康状态不验证业务发送认证、所有表的实际 TTL 或端到端写入成功。
+    # 内置导出器存在重试/内存缓冲，但当前未配置持久发送队列，故障或重试耗尽时仍可能丢数据。
+    # logging 只复用顶部 local 日志轮转规则，管理此容器的 stdout/stderr，不限制遥测表或采集缓冲大小。
     logging: *container-logging

@@ -1,0 +1,15 @@
+# 1. 这是官方 Collector 配置的合并片段，不是独立 Collector 的完整配置。
+# 使用 CUSTOM_OTELCOL_CONFIG_FILE 加载，保留内置配置和 OpAMP 下发的接收器、认证及导出器。
+processors:
+  # 2. 当前容器限制为 1 GiB：在接近限制前施加背压，为进程和瞬时分配留出空间。
+  # 调整容器内存时同时检查此处；它不限制磁盘，也不保证数据不会丢失。
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 768
+    spike_limit_mib: 128
+
+  # 3. 批量写入 ClickHouse；控制每批条数和等待时间，条数上限不是字节数上限。
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+    send_batch_max_size: 2000

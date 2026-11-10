@@ -1,0 +1,256 @@
+# 1. 本地单机 ClickStack。仅使用公开镜像，不编译或修改 ClickStack 源码。
+# 以 # 开头的行是说明文字，不参与运行；是否编译镜像由 image/build 等实际配置决定。
+# name 设置整套 Compose 的默认项目名，将相关容器、默认网络等资源归为同一组。
+# 例如 clickhouse 服务的首个容器通常名为 observability-infra-clickhouse-1：
+#   observability-infra = 项目名，clickhouse = 服务名，1 = 实例序号。
+# 默认网络通常名为 observability-infra_default；项目名不是数据库名或单个容器名。
+# 命令行 -p 或环境变量 COMPOSE_PROJECT_NAME 可以覆盖这里的默认项目名。
+name: observability-infra
+
+# 2. 限制每个容器自身的控制台日志；此限制不包含数据库、采集队列和业务日志。
+# x-logging 是自定义扩展字段，用来集中放置公共配置；x- 前缀允许 Compose 忽略该字段本身。
+# &container-logging 是 YAML 锚点，为下面这整块配置命名；*container-logging 是对它的引用。
+# 只有在某个服务中写下 logging: *container-logging，该服务才会实际采用这些规则。
+# 因此这不是自动应用于所有容器的全局开关，也不会影响本项目之外的容器。
+x-logging: &container-logging
+  # local 是 Docker 的本地日志驱动：收集容器的标准输出 stdout 和标准错误 stderr，
+  # 写入 Docker 管理的本地存储；这些内容可以通过 docker logs / docker compose logs 查看。
+  # 日志文件由 Docker 管理，位置不是下面绑定的 .data/clickhouse-logs/ 目录。
+  driver: local
+  options:
+    # 单个日志文件达到约 10 MB 时轮转，换一个文件继续写；m 在这里表示容量单位。
+    max-size: "10m"
+    # 每个采用此配置的容器最多保留 3 个日志文件，包含当前文件；超过时删除最旧文件。
+    # 按配置估算，每个容器约保留 10 MB × 3 的未压缩控制台日志量，不是所有容器合计。
+    # local 默认压缩轮转后的文件，实际磁盘占用受压缩等因素影响，并非严格的 30 MB 磁盘配额。
+    # 这里只限制 Docker 保存的控制台日志副本，不限制以下内容：
+    #   1) /var/lib/clickhouse 中的表数据、元数据和内部诊断表；
+    #   2) ClickHouse 自己写入 /var/log/clickhouse-server 的文本日志；
+    #   3) Collector 的持久化队列（如果配置了）。
+    # 注释中的“业务日志”指存入 ClickHouse 表的业务数据；若程序将业务日志输出到 stdout/stderr，
+    # 该控制台副本仍受这里的轮转规则约束。业务表保留多少天需要另外设置 TTL。
+    max-file: "3"
+
+# services 下每个键定义一个服务，以及该服务容器所用的镜像、环境变量、挂载和运行限制。
+services:
+  # 3. ClickHouse 保存日志、Span 和指标；数据库端口仅在 Compose 网络内开放。
+  # clickhouse 是服务名：docker compose up -d clickhouse 中最后一个参数就引用它。
+  # 没有显式配置 networks 时，服务加入项目默认网络；其他同网服务可通过 clickhouse 解析其地址。
+  # 当前没有 ports 映射，未向宿主机发布 8123/9000；在本机不能直接通过 localhost:8123 访问它。
+  # 同网客户端可以使用 http://clickhouse:8123（HTTP）或 clickhouse:9000（原生 TCP 协议）。
+  # 容器里的 localhost 指这个容器自身；例如 Collector 容器不能用 localhost 来指代 ClickHouse。
+  clickhouse:
+    # image 指定要运行的现成镜像，不在本项目中编译 ClickHouse；本地缺少镜像时默认尝试拉取。
+    # ${变量:-默认值} 由 Compose 在创建容器前展开：变量未设置或为空时，使用冒号后的默认值。
+    # 这里默认使用官方仓库 clickhouse/clickhouse-server 的固定版本标签 26.8.36.3-alpine；
+    # alpine 表示基于 Alpine Linux 的镜像变体。CLICKHOUSE_IMAGE 可覆盖整个镜像地址及标签。
+    # Compose 替换值可来自执行命令的 shell 环境或项目 .env；shell 中同名变量优先。
+    image: ${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:26.8.36.3-alpine}
+    # 容器主进程退出后，Docker 尝试重新启动；Docker 重启时也会恢复原先应运行的容器。
+    # 如果人为执行 stop，则保持停止，Docker 重启也不会替你启动；删除容器后此策略同样不再生效。
+    # 此策略针对容器退出，不会仅因 healthcheck 变为 unhealthy 就自动重启容器。
+    restart: unless-stopped
+    # 限制此容器可使用的内存，默认 4 GiB；可通过 CLICKHOUSE_MEMORY_LIMIT 覆盖。
+    # 这是容器层面的内存上限，不是预先占用 4 GiB，也不是单条 SQL 的内存限额或磁盘容量。
+    # 查询、缓存、后台合并等共同消耗内存；内存不足时可能查询失败或进程被 OOM 终止。
+    # 此处未单独配置 swap 限制；交换空间能否使用及额度还取决于 Docker/宿主机配置。
+    mem_limit: ${CLICKHOUSE_MEMORY_LIMIT:-4g}
+    # environment 才是传入容器的环境变量，下面这些变量由官方镜像的启动脚本读取。
+    # .env 为 Compose 提供替换值，并不表示 .env 中所有变量都会自动传入容器。
+    environment:
+      # 在空数据目录的初始化流程中创建 otel 数据库，作为后续遥测表的存放位置。
+      # 这里只创建数据库，不创建 otel_logs / otel_traces / otel_metrics_* 等业务表；
+      # 当前配置由 Collector 的导出初始化流程建表，客户端连接时仍需选择相应数据库。
+      # 复用已有数据目录时通常会跳过数据库初始化；修改此值不会重命名旧库或迁移已有表/TTL。
+      CLICKHOUSE_DB: otel
+      # 配置 ClickHouse 数据库账号 observability，不是容器内的 Linux 用户名。
+      # 当前文件中的 UI 和 Collector 使用相同数据库账号连接 ClickHouse。
+      CLICKHOUSE_USER: observability
+      # ${变量:?错误说明} 表示必填：变量未设置或为空时，Compose 直接报错，阻止本次操作。
+      # 密码取自 shell 环境或 .env，不把明文值写进此 YAML。
+      # 镜像启动脚本会据这些账号变量生成用户配置；不要将所有 environment 变量都理解为
+      # “仅首次启动生效”，也不要将修改它们当作对已有 SQL 用户、数据库和表的通用迁移。
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请先在 .env 中填写 ClickHouse 密码}
+      # 为上述配置账号开启 access_management，允许它通过 SQL 管理用户、角色及权限。
+      # 虽然变量名包含 DEFAULT，这里配置的是 observability 账号；不是开启密码验证的开关。
+      # 使用字符串 "1" 表达镜像要求的环境变量值。
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    # 这里三项均为宿主机路径绑定（bind mount），不是 Docker 自动命名的数据卷。
+    # 格式：宿主机路径:容器内路径[:挂载选项]；本项目中的 ./ 相对于 compose.yaml 所在目录。
+    # 挂载使容器直接读写宿主机对应内容，不是在启动时复制一份；未写 :ro 时默认可读写。
+    volumes:
+      # 数据目录：表数据、元数据等写到宿主机 .data/clickhouse/，而非仅存在于容器可写层。
+      # stop、rm 或重建容器不会自动删除这个宿主机目录；再次挂载同一路径可以复用原有数据。
+      # 删除容器并不等于清空数据库；目录绑定本身也不提供磁盘硬配额。
+      - ./.data/clickhouse:/var/lib/clickhouse
+      # ClickHouse 自身的文本运行日志；与 Docker logging 收集的 stdout/stderr 分别管理。
+      # 当前 XML 的 logger 段设置 warning 级别、20M 轮转大小和 count=3；不受上面的 10m/3 限制。
+      - ./.data/clickhouse-logs:/var/log/clickhouse-server
+      # 将单个 XML 配置片段挂入 config.d，启动时与镜像原有主配置合并，不替换整个主配置目录。
+      # 此片段管理自身文本日志、内部 9363/metrics 入口及若干 system 诊断表的 TTL。
+      # 业务遥测表的 TTL 在 clickhouse/retention.sql 中另行管理。
+      # :ro 表示容器只能读取此挂载文件，不能通过它写回宿主机；宿主机仍可编辑源文件。
+      - ./clickhouse/config.d/observability.xml:/etc/clickhouse-server/config.d/observability.xml:ro
+    # healthcheck 在此容器内部执行探测，为“进程在运行”之外再提供数据库是否可响应的状态。
+    # 状态初始为 starting，探测成功变为 healthy，达到连续失败阈值则变为 unhealthy。
+    # 后面的 app/collector 用 depends_on: condition: service_healthy，在启动时等待这里健康。
+    # 该启动依赖不代表运行期间数据库失联时会自动停止或重启所有下游服务。
+    healthcheck:
+      # CMD-SHELL 使用容器内的 /bin/sh 执行后面的命令，支持变量展开和 > 重定向。
+      # clickhouse-client 默认连本容器的 localhost:9000，用配置账号执行 SELECT 1。
+      # SELECT 1 成功说明能连接、认证并执行基础查询，不代表业务表已创建或遥测数据已经写入。
+      # $$ 让 Compose 保留一个字面量 $，再由容器内 shell 展开 CLICKHOUSE_USER/PASSWORD；
+      # 若直接写单个 $，变量可能在宿主机的 Compose 替换阶段就被处理。
+      # \" 是 YAML 双引号字符串内的引号转义，让 shell 将变量值作为完整的单个参数传入。
+      # >/dev/null 丢弃成功时输出的 1，保留退出码供 Docker 判定；标准错误没有被重定向。
+      test: ["CMD-SHELL", "clickhouse-client --user \"$$CLICKHOUSE_USER\" --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1' >/dev/null"]
+      # 正常阶段上一次探测完成后，间隔 10 秒再检查；启动宽限期可能采用 Docker 默认 start_interval。
+      interval: 10s
+      # 单次探测最多允许执行 5 秒，超时按失败处理。
+      timeout: 5s
+      # 连续失败 12 次后标记 unhealthy；成功会清零连续失败计数。这不是容器重启次数。
+      retries: 12
+      # 启动宽限期 30 秒：期间仍执行探测，尚未成功之前的失败不计入上述失败阈值。
+      # 若宽限期内已探测成功，会提前进入正常计数；不是必须等待 30 秒才开始检查或才能健康。
+      start_period: 30s
+    # 设置容器进程的操作系统资源限制；nofile 是每个进程可打开的文件描述符数量上限。
+    # 文件描述符不仅包含数据文件，还包含网络套接字等。ClickHouse 的数据分片、合并和连接会使用它们。
+    ulimits:
+      nofile:
+        # soft：进程当前使用的限制。提高额度不等于预先打开或分配这么多文件。
+        soft: 262144
+        # hard：普通进程自行提高 soft 时可达到的上限；此处让二者都为 262144。
+        # 这不是表数量、连接数配置或整台宿主机所有进程合计的文件上限。
+        hard: 262144
+    # 引用第 2 节的 YAML 锚点，等价于在这里展开 driver: local 和 max-size/max-file。
+    # 仅管理该 ClickHouse 容器的控制台日志，不管理上面绑定目录中的数据和文件日志。
+    logging: *container-logging
+
+  # 4. MongoDB 只保存平台账号、看板、告警等状态，不保存业务遥测明细。
+  # mongodb 是 Compose 服务名，也是同一默认网络中其他容器访问它时使用的主机名。
+  # 当前 app 的 MONGO_URI 为 mongodb://mongodb:27017/hyperdx：
+  #   mongodb:// 是协议，第二个 mongodb 是服务主机名，27017 是数据库端口，hyperdx 是应用数据库。
+  # 当前没有 ports 映射，因此没有将 27017 发布到电脑；同网容器仍可访问这个服务。
+  # MongoDB 支持账号密码，但本服务没有设置初始化账号变量、--auth 或认证配置文件，默认未启用认证。
+  # “未发布宿主机端口”与“启用数据库认证”分别控制访问入口和身份验证，不能互相替代。
+  # HyperDX 网页登录账号的数据保存在这里，但网页登录账号与 MongoDB 连接账号是两套身份。
+  # 新的空数据目录可同时提供 MONGO_INITDB_ROOT_USERNAME / MONGO_INITDB_ROOT_PASSWORD：
+  # 官方镜像会在 admin 认证数据库创建 root 角色账号，并启用认证；两个变量需要一起提供。
+  # 已有数据目录会跳过初始化账号创建，直接补变量可能启用认证却没有创建预期用户。
+  # 对现有实例应先创建并验证所需用户，再启用认证并更新 app 的连接配置，不能当作空库初始化。
+  # 若用上述管理员访问 hyperdx，URI 需带账号密码及 ?authSource=admin；URI 特殊字符需要编码。
+  # 长期使用时，应用应使用仅具备 hyperdx 所需权限的独立账号；这些说明不会实际启用认证。
+  mongodb:
+    # ${变量:-默认值}：MONGODB_IMAGE 未设置或为空时，使用 mongo:5.0.32-focal。
+    # 这是现成的 MongoDB 5.0.32 镜像，focal 表示 Ubuntu 20.04 基础镜像变体；本项目不编译它。
+    image: ${MONGODB_IMAGE:-mongo:5.0.32-focal}
+    # 容器主进程退出后自动尝试恢复；人为 stop 后保持停止，删除后不会自动重新创建。
+    # 单独出现 unhealthy 健康状态不会触发这条重启策略。
+    restart: unless-stopped
+    # 整个容器的内存上限默认 1 GiB，可由 shell 环境或 .env 中的 MONGODB_MEMORY_LIMIT 覆盖。
+    # 缓存、连接和查询等共同消耗这份内存；不是启动即占满，也不限制数据库的磁盘容量。
+    mem_limit: ${MONGODB_MEMORY_LIMIT:-1g}
+    # 宿主机目录绑定：左侧为本项目目录下的路径，右侧为容器内路径；默认可读写。
+    volumes:
+      # MongoDB 向 /data/db 写入的数据库文件实际保存在电脑 .data/mongodb/，包含平台配置等内容。
+      # 停止、删除或重建容器不会自动删除宿主机目录；挂载同一路径即可复用已有数据。
+      # 此目录与保存业务遥测明细的 .data/clickhouse/ 分别管理；绑定本身没有磁盘硬配额。
+      - ./.data/mongodb:/data/db
+    # 健康检查在 MongoDB 容器内部执行；app 在启动时等待本服务达到 healthy 状态。
+    healthcheck:
+      # CMD 直接执行 mongo 客户端及参数，不经过 shell；这里的 mongo 是 5.0 镜像中的命令行客户端。
+      # 未指定主机时连接本容器数据库；--quiet 减少客户端启动提示，--eval 执行后面的 JavaScript。
+      # db.adminCommand('ping') 检查数据库能否响应命令；不是网络 ICMP ping，也不代表管理员登录。
+      # .ok 读取命令成功标记；三元表达式将成功映射为退出码 0、失败映射为 1，再由 quit 退出。
+      # ping 不要求认证，所以开启认证后本检查仍可能通过；它不验证应用账号、权限或实际读写能力。
+      test: ["CMD", "mongo", "--quiet", "--eval", "quit(db.adminCommand('ping').ok ? 0 : 1)"]
+      # 正常阶段每次检查完成后，间隔 10 秒再次检查；启动期可能使用 Docker 默认 start_interval。
+      interval: 10s
+      # 单次检查超过 5 秒按失败处理。
+      timeout: 5s
+      # 连续失败 12 次后标记 unhealthy，成功会清零连续失败计数；不是自动重启次数。
+      retries: 12
+      # 启动宽限期 20 秒，期间仍有检查；尚未成功之前的失败不计入阈值。
+      # 若期间检查成功，会提前变为 healthy 并开始正常失败计数，不必等待满 20 秒。
+      start_period: 20s
+    # 复用顶部 local 日志驱动规则：单文件约 10 MB、最多 3 个文件，超过时轮转删除旧日志。
+    # 只管理容器 stdout/stderr 的日志副本，不限制 /data/db 中数据库文件的大小。
+    logging: *container-logging
+
+  # 5. UI/API 提供查询和账号管理，并通过 OpAMP 为官方 Collector 提供接收配置。
+  app:
+    image: ${CLICKSTACK_APP_IMAGE:-hyperdx/hyperdx:2.43.1}
+    restart: unless-stopped
+    mem_limit: ${CLICKSTACK_APP_MEMORY_LIMIT:-2g}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${HYPERDX_APP_PORT:-18080}:${HYPERDX_APP_PORT:-18080}"
+      - "127.0.0.1:${HYPERDX_API_PORT:-18001}:${HYPERDX_API_PORT:-18001}"
+    environment:
+      HYPERDX_APP_PORT: ${HYPERDX_APP_PORT:-18080}
+      HYPERDX_API_PORT: ${HYPERDX_API_PORT:-18001}
+      HYPERDX_APP_URL: http://localhost
+      FRONTEND_URL: http://localhost:${HYPERDX_APP_PORT:-18080}
+      SERVER_URL: http://localhost:${HYPERDX_API_PORT:-18001}
+      MONGO_URI: mongodb://mongodb:27017/hyperdx
+      OPAMP_PORT: "4320"
+      EXPRESS_SESSION_SECRET: ${EXPRESS_SESSION_SECRET:?请先在 .env 中填写会话密钥}
+      HYPERDX_LOG_LEVEL: info
+      USAGE_STATS_ENABLED: "false"
+      OTEL_SERVICE_NAME: clickstack-platform
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+      # 5.1. 密码要求使用十六进制字符串，避免将引号或换行插入下方 JSON。
+      DEFAULT_CONNECTIONS: >-
+        [{"name":"Local ClickHouse","host":"http://clickhouse:8123","username":"observability","password":"${CLICKHOUSE_PASSWORD:?请先在 .env 中填写 ClickHouse 密码}"}]
+      # 5.2. 使用官方表字段，明确日志与 Trace 的双向关联；配置在账号初始化时使用。
+      DEFAULT_SOURCES: >-
+        [
+          {"name":"Logs","kind":"log","connection":"Local ClickHouse","from":{"databaseName":"otel","tableName":"otel_logs"},"timestampValueExpression":"Timestamp","displayedTimestampValueExpression":"Timestamp","implicitColumnExpression":"Body","bodyExpression":"Body","serviceNameExpression":"ServiceName","eventAttributesExpression":"LogAttributes","resourceAttributesExpression":"ResourceAttributes","severityTextExpression":"SeverityText","severityNumberExpression":"SeverityNumber","traceIdExpression":"TraceId","spanIdExpression":"SpanId","defaultTableSelectExpression":"Timestamp,ServiceName,SeverityText,Body","traceSourceId":"Traces","metricSourceId":"Metrics"},
+          {"name":"Traces","kind":"trace","connection":"Local ClickHouse","from":{"databaseName":"otel","tableName":"otel_traces"},"timestampValueExpression":"Timestamp","displayedTimestampValueExpression":"Timestamp","implicitColumnExpression":"SpanName","serviceNameExpression":"ServiceName","eventAttributesExpression":"SpanAttributes","resourceAttributesExpression":"ResourceAttributes","traceIdExpression":"TraceId","spanIdExpression":"SpanId","parentSpanIdExpression":"ParentSpanId","spanNameExpression":"SpanName","spanKindExpression":"SpanKind","durationExpression":"Duration","durationPrecision":9,"statusCodeExpression":"StatusCode","statusMessageExpression":"StatusMessage","spanEventsValueExpression":"Events","spanLinksValueExpression":"Links","defaultTableSelectExpression":"Timestamp,ServiceName,StatusCode,round(Duration/1e6),SpanName","logSourceId":"Logs","metricSourceId":"Metrics"},
+          {"name":"Metrics","kind":"metric","connection":"Local ClickHouse","from":{"databaseName":"otel","tableName":""},"timestampValueExpression":"TimeUnix","resourceAttributesExpression":"ResourceAttributes","metricTables":{"gauge":"otel_metrics_gauge","histogram":"otel_metrics_histogram","sum":"otel_metrics_sum","summary":"otel_metrics_summary","exponential histogram":"otel_metrics_exponential_histogram"},"logSourceId":"Logs"}
+        ]
+    # 5.3. 覆盖镜像硬编码 8000 的检查，同时验证当前端口的 API、前端与 OpAMP。
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "Promise.all([process.env.HYPERDX_API_PORT + '/ready', process.env.HYPERDX_APP_PORT + '/', process.env.OPAMP_PORT + '/ready'].map(p => fetch('http://127.0.0.1:' + p, {signal: AbortSignal.timeout(3000)}))).then(rs => process.exit(rs.every(r => r.ok) ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    logging: *container-logging
+
+  # 6. 中心 Collector 通过 OTLP 接收数据，使用平台下发的采集认证和内置导出流程。
+  collector:
+    image: ${CLICKSTACK_COLLECTOR_IMAGE:-hyperdx/hyperdx-otel-collector:2.43.1}
+    restart: unless-stopped
+    mem_limit: ${COLLECTOR_MEMORY_LIMIT:-1g}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${OTLP_GRPC_PORT:-4317}:4317"
+      - "127.0.0.1:${OTLP_HTTP_PORT:-4318}:4318"
+    environment:
+      CLICKHOUSE_ENDPOINT: tcp://clickhouse:9000?dial_timeout=10s
+      CLICKHOUSE_USER: observability
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?请先在 .env 中填写 ClickHouse 密码}
+      HYPERDX_OTEL_EXPORTER_CLICKHOUSE_DATABASE: otel
+      HYPERDX_OTEL_EXPORTER_CREATE_LEGACY_SCHEMA: "true"
+      # 6.1. 2.43.1 的 legacy/OpAMP 路径使用统一建表 TTL；分类型策略由 retention.sql 管理。
+      HYPERDX_OTEL_EXPORTER_TABLES_TTL: ${TABLES_RETENTION:-720h}
+      CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT: clickhouse:9363
+      HYPERDX_LOG_LEVEL: info
+      OPAMP_SERVER_URL: http://app:4320
+      CUSTOM_OTELCOL_CONFIG_FILE: /etc/otelcol-contrib/custom.yaml
+    volumes:
+      - ./collector/custom.yaml:/etc/otelcol-contrib/custom.yaml:ro
+    logging: *container-logging

@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <!-- 1. 数据库自身的文本日志按文件大小轮转；它们与业务日志表的 TTL 分别管理。 -->
+    <logger>
+        <level>warning</level>
+        <size>20M</size>
+        <count>3</count>
+    </logger>
+
+    <!-- 2. 仅在容器网络内提供数据库自身指标，供官方 Collector 默认管道抓取。 -->
+    <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>9363</port>
+        <metrics>true</metrics>
+        <asynchronous_metrics>true</asynchronous_metrics>
+        <events>true</events>
+        <errors>true</errors>
+    </prometheus>
+
+    <!-- 3. 设置数据库自身诊断表的保留期限，避免遗漏这一部分磁盘占用。 -->
+    <!-- TTL 在后台执行，既不是即时删除，也不是整个数据库的容量上限。 -->
+    <query_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_log>
+    <query_thread_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_thread_log>
+    <part_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></part_log>
+    <trace_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></trace_log>
+    <text_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></text_log>
+    <metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></metric_log>
+    <asynchronous_metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></asynchronous_metric_log>
+</clickhouse>

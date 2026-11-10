@@ -1,0 +1,11 @@
+# 1. 本地配置和持久化数据不进入版本控制；示例配置需要保留。
+.env
+.env.*
+!.env.example
+.data/
+backups/
+
+# 2. 忽略开发工具和系统临时文件。
+.idea/
+.DS_Store
+*.log

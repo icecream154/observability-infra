@@ -128,7 +128,7 @@ OTEL_EXPORTER_OTLP_HEADERS=authorization=<预配置token>
 2. 将日志正文、时间、级别、TraceId、SpanId 和资源属性映射到标准字段，再上传。
 3. 为 Go/Python 的已有 Span 接入 OTLP 导出器；可以先发本机 Agent，再统一转发到中心。
 
-当前变更只覆盖中心配置，没有在业务机器部署 Agent，也没有修改 Go/Python 的 Logger 或 Span 导出代码。
+`go-service-template` 项目自己的 Compose 会一起启动 Go 服务和日志 Agent。Agent 在业务机器读取本地日志，通过上述 OTLP 入口转发到中心。
 
 ## 查询和数据保留
 

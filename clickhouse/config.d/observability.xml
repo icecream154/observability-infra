@@ -1,29 +1,208 @@
 <?xml version="1.0"?>
 <clickhouse>
-    <!-- 1. 数据库自身的文本日志按文件大小轮转；它们与业务日志表的 TTL 分别管理。 -->
+    <!--
+        1. ClickHouse 自身的文本运行日志
+
+        这里记录的是数据库进程的运行情况，例如启动、后台任务、警告和错误，
+        不是 Go/Python 业务发来的日志，也不是 otel.otel_logs 表中的数据。
+        本文件作为 config.d 下的配置片段与镜像主配置合并；这里只覆盖 level、size、count，
+        日志文件路径、是否额外输出到控制台等未在这里设置的参数仍由其他配置决定。
+        当前镜像的文件日志位于容器 /var/log/clickhouse-server/，Compose 将此目录绑定到
+        宿主机 .data/clickhouse-logs/，便于重建容器后保留和排查数据库自身的问题。
+
+        本项目有三套需要分别理解的保留规则：
+          a. 这里的 logger：控制 ClickHouse 自身文本日志文件的级别和大小轮转；
+          b. compose.yaml 的 logging：控制 Docker 保存的容器 stdout/stderr 日志副本；
+          c. ClickHouse 表的 TTL：控制业务遥测表和下面 system 诊断表中数据的保留时间。
+        它们不能互相替代；修改这里的大小和份数，不会删除业务日志或 Span 表中的数据。
+    -->
     <logger>
+        <!--
+            普通主日志的记录级别为 warning：保留 warning 及更严重的 error、critical、fatal 等，
+            不记录该输出通道中的 information、debug、trace 等较低级别信息，以减少日志量。
+            这是数据库自身文本日志的过滤规则，不会修改业务日志的 SeverityText/SeverityNumber，
+            也不会让数据库停止统计错误、执行查询或运行后台合并任务。
+            独立 errorlog 通道等还可能有自己的级别配置，不能据此推断所有输出都只含 warning 以上。
+            排查问题时可以临时提高日志详细程度，但更详细的日志会增加写盘量并更快触发轮转。
+        -->
         <level>warning</level>
+
+        <!--
+            单个文本日志文件按约 20M 的大小阈值轮转：达到阈值后将旧文件归档，继续写新的当前文件。
+            这是按文件大小换文件，不是按天切分，也不是文件保留 20 分钟或表数据保留 20 天。
+            普通日志与独立错误日志等文件分别应用轮转规则，不是整个目录合计只能使用 20M。
+            阈值用于触发轮转，并非精确的磁盘硬配额；单次写入等因素可能使文件越过阈值。
+        -->
         <size>20M</size>
+
+        <!--
+            每类日志文件最多保留 3 份历史归档，当前正在写入的文件另算；超过时淘汰最旧归档。
+            因此 count=3 不是目录总共只能有 3 个文件，也不表示保留 3 天。
+            普通日志和错误日志分别轮转，不能用 20M × 3 作为整个目录的最大磁盘占用。
+            归档压缩、当前文件及其他文件也会影响实际占用；这里不限制数据库数据目录的容量。
+        -->
         <count>3</count>
     </logger>
 
-    <!-- 2. 仅在容器网络内提供数据库自身指标，由中心独立 Collector 的 Prometheus 接收器抓取。 -->
+    <!--
+        2. 将 ClickHouse 自身的运行指标通过 HTTP 暴露为 Prometheus 文本格式
+
+        prometheus 这一段让 ClickHouse 自己提供一个可读取的指标接口，
+        并不是安装或启动一个额外的 Prometheus 服务，也不是接收业务日志和 Span 的接口。
+        本项目由中心独立 Collector 的 prometheus/clickhouse 接收器主动抓取此接口，
+        不需要再部署 Prometheus 服务器就能完成当前的指标采集。
+
+        三个端口分别承担不同职责：
+          9000：ClickHouse 原生 TCP 协议，当前 Collector 用它写入遥测数据；
+          8123：ClickHouse HTTP 查询接口，HyperDX 用它查询数据；
+          9363：本段配置的数据库自身指标 HTTP 接口，由 Collector 定期读取。
+        远端业务机器应将日志和 Span 发到 Collector 的 OTLP 4317/4318，不能发到这里的 9363。
+
+        当前链路：
+          ClickHouse 内部状态和计数
+            → http://clickhouse:9363/metrics
+            → Collector 每 30 秒抓取一次
+            → memory_limiter / batch 处理
+            → ClickHouse 的 otel.otel_metrics_* 指标表
+            → HyperDX 的 Metrics 数据源查询与展示。
+        30 秒来自 collector/custom.yaml 的 scrape_interval，而非此 XML。
+        本接口提供读取时的状态和累计计数；定期抓取、写表及表的保留策略才形成可查询的历史数据。
+        接口存在不代表数据已经落库，Collector 还需要成功抓取并导出。
+
+        下列四个布尔项决定暴露哪些数据库指标，不负责采集 Go/Python 的业务日志或业务指标。
+        设为 false 只是停止通过这个接口暴露对应类别，不会停止查询、合并或内部统计功能。
+
+        当前仅为 Compose 网络内的组件配置此接口，Compose 没有向宿主机发布 9363 端口；
+        这不是 prometheus 标签自身提供了访问控制。若以后增加端口映射，需要另行考虑可访问范围。
+        clickhouse 是 Compose 服务名；Collector 中的 localhost 指 Collector 自己，不能代替这个名字。
+    -->
     <prometheus>
+        <!--
+            HTTP 路径：客户端向 /metrics 发起读取请求，获得 Prometheus 格式的指标。
+            endpoint 只设置路径，不是完整 URL，不是业务 OTLP 的 /v1/logs 或 /v1/traces。
+            若修改此路径，应同步修改 collector/custom.yaml 中的 metrics_path。
+        -->
         <endpoint>/metrics</endpoint>
+
+        <!--
+            指标 HTTP 服务使用的容器端口，结合上面的路径得到 http://clickhouse:9363/metrics。
+            若修改此端口，应同步修改 Collector 的抓取目标 CLICKHOUSE_METRICS_TARGET。
+            此处设置监听端口不会自动将它映射到宿主机或公网。
+        -->
         <port>9363</port>
+
+        <!--
+            暴露 system.metrics 对应的即时指标，主要表示“现在有多少”。
+            例如当前正在执行的查询数 Query、正在运行的合并数 Merge。
+            这些状态可以增加也可以减少，不应把当前查询数当作历史累计查询次数。
+        -->
         <metrics>true</metrics>
+
+        <!--
+            暴露 system.asynchronous_metrics 对应的后台周期计算指标，
+            例如部分内存、文件系统可用空间等状态。
+            asynchronous 指 ClickHouse 在后台周期性更新这些数值；接口返回最近一次计算结果，
+            不表示 Collector 使用异步传输，也不表示每次 HTTP 读取都会重新计算全部指标。
+            ClickHouse 内部计算周期与 Collector 每 30 秒的抓取周期是两个不同的概念。
+        -->
         <asynchronous_metrics>true</asynchronous_metrics>
+
+        <!--
+            暴露 system.events 对应的 ProfileEvents 累计事件计数，主要表示“累计发生过多少次”。
+            例如 SelectQuery 统计 SELECT 查询相关事件的次数，而不是当前正在运行的查询数。
+            这类计数通常从当前数据库进程启动后累计，进程重启后需要按计数器重置处理；
+            查询一段时间内的发生量或速率时，需要比较采样点，而不是直接将累计值当作每秒速率。
+            查询事件可能包含内部活动，也不应把查询事件计数直接等同于成功完成的业务请求数。
+        -->
         <events>true</events>
+
+        <!--
+            暴露 ClickHouse 按错误码分类的累计错误计数及汇总值，相关信息可在 system.errors 中理解。
+            它表示数据库内部记录过多少次对应错误，不是错误日志正文、堆栈或 Go/Python 异常日志。
+            部分异常会被数据库内部捕获和处理，因此计数增长也不一定代表业务查询最终失败；
+            排查时应结合具体错误类型、数据库日志和实际请求结果判断。
+            计数同样需要考虑数据库进程重启，不能当作跨重启永久保存的错误总数。
+        -->
         <errors>true</errors>
     </prometheus>
 
-    <!-- 3. 设置数据库自身诊断表的保留期限，避免遗漏这一部分磁盘占用。 -->
-    <!-- TTL 在后台执行，既不是即时删除，也不是整个数据库的容量上限。 -->
+    <!--
+        3. ClickHouse 自身诊断表的 TTL（数据保留期限）
+
+        ClickHouse 把 SQL 执行、数据块变动、性能采样等诊断记录写入下面的 system.*_log 表。
+        服务端把此处的 ttl 写入对应表的 MergeTree 定义。event_date 是只有年月日的 Date 列。
+        event_date + INTERVAL 7 DAY 得出每条记录的到期日期，DELETE 指定过期后的动作是删除该记录。
+        例如 11 月 11 日 15:30 产生的记录，按 7 天规则在 11 月 18 日进入过期范围，
+        同一天早上和晚上产生的记录共享这个日期边界。按 3 天规则则在 11 月 14 日到期。
+        ClickHouse 在后台合并或回收数据块时处理过期记录。在清理完成前仍可能查到这些行，
+        磁盘占用取决于记录量、写入速率和清理进度。采样、记录和刷盘频率由各自的设置控制。
+
+        例如 HyperDX 查询 otel.otel_logs 时，SQL 的执行耗时和扫描行数可以写入 system.query_log，
+        按这里的 7 天规则清理。SQL 查到的业务日志仍按 otel.otel_logs 自己的 TTL 保留。
+        业务日志和 OpenTelemetry Span 分别写入 otel.otel_logs 和 otel.otel_traces，按遥测记录的时间计算过期。
+        collector/custom.yaml 将 TABLES_RETENTION（默认 720h，即 30 天）用于新建遥测表。
+        如显式执行 clickhouse/retention.sql，脚本会将指定的业务日志和 Span 表改为 7 天，指标表改为 30 天。
+        Collector 从 /metrics 抓取后保存到 otel.otel_metrics_* 的样本也遵循遥测表的 TTL。
+
+        已有表的实际 TTL 可在 SHOW CREATE TABLE 的结果中查看。
+        ClickHouse 26.8 在准备系统日志表时，如果现有定义和配置要求不同，可能把旧表改名为
+        query_log_0 等名称，再按新定义创建当前表。归档表保留原有数据和原有 TTL 状态，
+        因此检查诊断日志的磁盘占用时，也要把这些旧表计算在内。
+        TTL 执行机制见 https://clickhouse.com/docs/concepts/features/operations/delete/ttl
+        系统日志建表和归档逻辑见 https://github.com/ClickHouse/ClickHouse/blob/26.8/src/Interpreters/SystemLog.cpp
+    -->
+
+    <!--
+        system.query_log 记录 SQL 执行的整体情况，保留 7 天。
+        可按 query_id 查 SQL 文本、耗时、读取和写入的行数及字节数、内存用量和异常信息。
+        一条成功执行的 SQL 可以有 QueryStart 和 QueryFinish 两条记录。排查慢查询时，
+        通常从 QueryFinish 记录查看完整耗时和资源用量。
+    -->
     <query_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_log>
+
+    <!--
+        system.query_thread_log 记录每个查询执行线程的明细，保留 7 天。
+        一条 SQL 可以由多个线程并行执行，可通过 query_id 与 query_log 对照，
+        查看各线程的耗时、读取行数等，分析工作量在各线程之间的分布。
+        生成这些明细还需满足相应查询设置，例如 log_query_threads=1。
+    -->
     <query_thread_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_thread_log>
+
+    <!--
+        system.part_log 记录 MergeTree 数据块（part）的变动，保留 7 天。
+        例如一次写入生成新数据块（NewPart）、后台把多个小块合并成大块（MergeParts）、
+        移除旧块（RemovePart）。可以查看涉及的库、表、数据块及操作耗时。
+        此 TTL 清理的是变动历史。相关数据块的保留由所属表的规则管理。
+    -->
     <part_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></part_log>
+
+    <!--
+        system.trace_log 保存 ClickHouse 进程内部的调用栈采样，保留 3 天。
+        例如在 CPU 或内存相关采样发生时记录线程调用的函数，用于分析数据库自身的性能开销。
+        采样记录由 ClickHouse 的性能分析设置控制。业务请求的分布式 Span 单独存入 otel.otel_traces。
+    -->
     <trace_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></trace_log>
+
+    <!--
+        system.text_log 保存 ClickHouse 自身的文本运行消息，保留 3 天。
+        消息以表行保存，可按时间、级别、组件、消息正文或 query_id 查询。
+        表内日志的级别可用 text_log.level 配置。宿主机 .data/clickhouse-logs/ 下的文本文件
+        继续按前面的 logger.size 和 logger.count 轮转。
+    -->
     <text_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></text_log>
+
+    <!--
+        system.metric_log 保存 ClickHouse 定期采样的内部指标历史，保留 3 天。
+        包括采样时 system.metrics 的即时值，例如正在运行的查询数和合并数，
+        以及 system.events 中事件计数在采样间隔内的增量，可用来回看数据库当时的负载。
+        ClickHouse 在这里直接保存内部采样，Collector 的 Prometheus 抓取管道另外写入遥测指标表。
+    -->
     <metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></metric_log>
+
+    <!--
+        system.asynchronous_metric_log 保存 system.asynchronous_metrics 的历史值，保留 3 天。
+        这些指标由 ClickHouse 在后台周期计算，例如内存和文件系统可用空间。
+        可用这张表查看近期资源变化。TTL 管理已保存样本的保留时间。
+    -->
     <asynchronous_metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></asynchronous_metric_log>
 </clickhouse>

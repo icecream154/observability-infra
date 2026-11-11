@@ -185,10 +185,45 @@ flowchart TD
     Start[Collector 镜像入口] --> Mode{OPAMP_SERVER_URL 为空}
     Mode -->|当前配置| Base[内置 config.yaml]
     Base --> Standalone[内置 standalone-config.yaml]
-    Standalone --> Auth[OTLP_AUTH_TOKEN 启用静态认证配置]
+    Standalone -->|OTLP_AUTH_TOKEN 有值| Auth[加载内置 standalone-auth-config.yaml]
     Auth --> Custom[合并挂载的 custom.yaml]
     Custom --> Run[直接运行 Collector]
     Mode -->|非空时的另一模式| Supervisor[OpAMP Supervisor 获取远程配置]
+```
+
+| 加载顺序 | 文件来源 | 容器内路径 |
+|---:|---|---|
+| 1 | 镜像内置，上游 `docker/otel-collector/config.yaml` | `/etc/otelcol-contrib/config.yaml` |
+| 2 | 镜像内置，上游 `docker/otel-collector/config.standalone.yaml` | `/etc/otelcol-contrib/standalone-config.yaml` |
+| 3 | 镜像内置，上游 `docker/otel-collector/config.standalone.auth.yaml`。当前独立模式下，启动脚本发现 `OTLP_AUTH_TOKEN` 有值时加载 | `/etc/otelcol-contrib/standalone-auth-config.yaml` |
+| 4 | 本项目的 `./collector/custom.yaml`，通过 `volumes` 只读挂载 | `/etc/otelcol-contrib/custom.yaml` |
+
+上游 Dockerfile 在构建镜像时就把前三份复制进了镜像文件系统，因此它们随容器提供，在本项目目录和 `volumes` 列表里都找不到。Compose 通过 `CUSTOM_OTELCOL_CONFIG_FILE` 把第四份的容器内路径传给镜像入口脚本。脚本按表中的顺序传入四个 `--config` 参数，由同一个 Collector 进程合并后使用。
+
+Compose 从 `.env` 或启动 Compose 的 shell 环境取出 `OTLP_AUTH_TOKEN`，通过 `collector.environment` 传进容器。镜像启动脚本和 Collector 进程都可以读取这个环境变量。
+
+1. **启动脚本用它判断是否加载认证文件。** 当前独立模式走静态认证分支。脚本中的 `-n` 检查变量是否非空，条件成立就把第三份 YAML 的路径加到启动参数里。当前 Compose 要求这个变量有值，因此正常启动时会加载第三份文件。 [镜像入口脚本](https://github.com/hyperdxio/hyperdx/blob/821c2f93357b47d5ff932ea99d2adf93289815a5/docker/otel-collector/entrypoint.sh#L93-L113)
+
+   ```sh
+   # /entrypoint.sh 中的静态认证分支摘录
+   elif [ -n "$OTLP_AUTH_TOKEN" ]; then
+     COLLECTOR_ARGS="$COLLECTOR_ARGS --config /etc/otelcol-contrib/standalone-auth-config.yaml"
+   ```
+
+2. **Collector 用它的具体值验证请求。** 内置 YAML 通过 `${env:OTLP_AUTH_TOKEN}` 引用环境变量。Collector 读取配置时把这个占位符展开为容器环境中的 token，并把得到的值交给 `bearertokenauth/hyperdx` 认证器。该文件同时把这个认证器挂到 OTLP 的 HTTP 和 gRPC 接收器上。下面是 `tokens` 字段中的两条规则。 [内置认证配置](https://github.com/hyperdxio/hyperdx/blob/821c2f93357b47d5ff932ea99d2adf93289815a5/docker/otel-collector/config.standalone.auth.yaml)
+
+   ```yaml
+   tokens:
+     - ${env:OTLP_AUTH_TOKEN}
+     - Bearer ${env:OTLP_AUTH_TOKEN}
+   ```
+
+   业务后端通过 HTTP 上报时，可以发送 `Authorization: Bearer <你的 token>`。认证器会把请求头的值和展开后的规则比较。gRPC 使用同名的 `authorization` 元数据传递凭据。
+
+Collector 启动后，可以在项目目录下列出容器内的配置文件。
+
+```bash
+docker compose exec collector ls -l /etc/otelcol-contrib/
 ```
 
 本项目不走图中的 OpAMP 分支。HyperDX 镜像仍启动自己的内部 OpAMP 服务，但采集不使用它，app 的健康检查也不再依赖该端口。
@@ -252,28 +287,51 @@ sequenceDiagram
 
 `CREATE_LEGACY_SCHEMA=true` 会跳过另一套独立迁移工具，并由导出器按 `create_schema=true` 创建所需表。这仍是建表流程；对已有表的结构、权限和 TTL 修改需要相应数据库操作。
 
-### custom.yaml 补充了什么
+### 按顺序读 collector/custom.yaml
 
-`collector/custom.yaml` 当前承担四类配置：
+#### 1. `receivers.prometheus/clickhouse` 配置从哪抓指标
 
-| 内容 | 当前值和用途 |
-| --- | --- |
-| ClickHouse 自身指标抓取 | `prometheus/clickhouse` 每 30 秒抓取 `/metrics` |
-| 内存保护 | 每秒检查；软阈值 640 MiB、硬阈值 768 MiB |
-| 批处理 | 1000 个记录或数据点触发，定时 5 秒发送，单批最多 2000 个 |
-| 新表默认 TTL 覆盖 | 为 `clickhouse` 和 `clickhouse/rrweb` 两个导出器读取统一 TTL 环境值 |
+`receivers` 定义输入组件。`prometheus/clickhouse` 是一个 Prometheus 接收器实例，`config.scrape_configs` 列出它要执行的抓取任务。
 
-内置配置保留 Session/rrweb 会话回放分支，本项目尚未接入这类数据。这里同时覆盖它的 TTL，是为了让保留的内置分支使用一致的默认时长，并不表示当前已经采集了会话回放。
+- `job_name: clickhouse` 给抓取任务命名，方便区分指标来源。
+- `scrape_interval: 30s` 表示每 30 秒抓取一次。
+- `metrics_path: /metrics` 是抓取时访问的 HTTP 路径。
+- `static_configs` 下的 `targets` 列出固定的抓取地址。Compose 通过 `CLICKHOUSE_METRICS_TARGET` 传入 `clickhouse:9363`，YAML 里也用这个地址作为默认值。
 
-指标抓取目标使用 `CLICKHOUSE_METRICS_TARGET: clickhouse:9363`。本项目明确增加 `metrics/clickhouse` 管道，把抓取结果写入 ClickHouse。这里只监控数据库自身，不会自动发现 Go/Python 的业务指标。
+这几个字段合起来，就是 Collector 每 30 秒访问一次 `http://clickhouse:9363/metrics`，读取 ClickHouse 自身的运行指标。
 
-当前没有设置旧变量 `CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT`。该镜像 standalone 入口会据其启用 remote-write，而当前 9363 提供的是可抓取的 `/metrics`，不是接收 `/write` 的端口。
+#### 2. `processors.memory_limiter` 配置什么时候暂停接收
 
-内存限制器观测 Collector 的 Go 堆，不等于整个容器 RSS。`limit_mib=768` 是内部硬阈值，`spike_limit_mib=128` 留出检测间隔内的余量，软阈值为 640 MiB。达到限制状态会向上游返回可重试错误；能否重试和保持数据，仍取决于上下游缓冲与重试配置。
+这个处理器检查 Collector 存放运行中对象的内存，也就是 Go 堆。内存占用过高时，它会暂时拒收更多数据，告诉发送方可以稍后重试。
 
-批处理中的 1000 是触发阈值，2000 才是单批记录数量上限。日志按 LogRecord、Trace 按 Span、指标按数据点计数，不按字节数计数。`timeout: 5s` 是定时交给下游的条件，不是端到端落库时限。
+- `check_interval: 1s` 表示每秒检查一次内存。
+- `limit_mib: 768` 设置堆内存硬阈值。检查发现超过 768 MiB 时，限制器会进一步尝试强制垃圾回收。
+- `spike_limit_mib: 128` 为两次检查之间的内存增长留出余量。开始限制的软阈值是 `768 - 128 = 640 MiB`，检查发现堆内存超过这个值就会暂时拒收。
 
-Collector 默认容器上限为 1 GiB。修改 `COLLECTOR_MEMORY_LIMIT` 时，也需要核对固定的内部内存阈值和批次参数。
+整个容器的内存上限由 Compose 的 `mem_limit` 控制，`COLLECTOR_MEMORY_LIMIT` 默认是 1 GiB。上面的 640 MiB 和 768 MiB 用于 Collector 内部判断，修改容器上限时应一起查看这两个阈值。
+
+#### 3. `processors.batch` 配置什么时候发一批、每批多大
+
+- `timeout: 5s` 设置定时发送间隔。即使只有几十条，定时触发时也会把已经积攒的数据交给下游。
+- `send_batch_size: 1000` 设置按数量触发的阈值。攒到 1000 条就可以发送。例如一次收到 1500 条，可以一起交给下游。
+- `send_batch_max_size: 2000` 设置单批数量上限。攒到超过 2000 条时，发送前会拆成较小的批次。
+
+日志按日志记录数算，Trace 按 Span 数算，指标按数据点数算。这里的发送是交给后续导出器，实际写入还要经过导出器的处理。
+
+#### 4. `exporters` 下的 `ttl` 配置新表默认保留多久
+
+- `clickhouse.ttl` 为普通导出器创建的日志、Span 和指标表设置默认保留期。
+- `clickhouse/rrweb.ttl` 为浏览器会话回放表设置相同的默认保留期。会话回放用于重现用户在网页上的点击、滚动和页面变化，需要业务网页接入录制 SDK。本项目目前保留了写入分支，尚未接入录制。
+
+两处都写 `${env:HYPERDX_OTEL_EXPORTER_TABLES_TTL:-720h}`。Compose 把 `TABLES_RETENTION` 的值传给这个容器环境变量，默认 `720h`，也就是 30 天。已有表继续使用各自表定义中的 TTL。
+
+#### 5. `service.pipelines.metrics/clickhouse` 把抓取、处理和写库连起来
+
+`metrics/clickhouse` 是实际运行的指标管道。它按下列字段引用前面定义的组件。
+
+- `receivers: [prometheus/clickhouse]` 使用第 1 项的接收器抓取指标。
+- `processors: [memory_limiter, batch]` 先做第 2 项的内存保护，再按第 3 项积攒批次。
+- `exporters: [clickhouse]` 把处理完的指标交给 ClickHouse 导出器，写入 `otel.otel_metrics_*` 中对应的表。
 
 ## 7 HyperDX 如何查询和展示
 

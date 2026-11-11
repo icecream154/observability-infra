@@ -365,7 +365,19 @@ services:
     # 以下变量传入容器，供镜像入口脚本和最终 Collector 配置读取。
     # .env 提供 Compose 替换值，environment 决定传入哪些变量；变量命名和用途由当前镜像约定。
     environment:
-      # 显式清空以选择 standalone；启动时按顺序合并内置基础、独立管道、静态认证和 custom.yaml。
+      # 显式清空以选择 standalone。镜像入口脚本 /entrypoint.sh 按下面的顺序传入 --config，
+      # 由同一个 Collector 进程读取并合并这四份配置。
+      # 1. 基础配置。上游 docker/otel-collector/config.yaml 打包到镜像内
+      #    /etc/otelcol-contrib/config.yaml，提供处理器和健康检查等基础设置。
+      # 2. 独立模式配置。上游 docker/otel-collector/config.standalone.yaml 打包到镜像内
+      #    /etc/otelcol-contrib/standalone-config.yaml，提供 OTLP 接收器、写库导出器和管道。
+      # 3. 静态认证配置。上游 docker/otel-collector/config.standalone.auth.yaml 打包到镜像内
+      #    /etc/otelcol-contrib/standalone-auth-config.yaml。当前由 OTLP_AUTH_TOKEN 启用。
+      # 4. 项目自定义配置。下方 volumes 将宿主机 ./collector/custom.yaml 只读挂载到
+      #    /etc/otelcol-contrib/custom.yaml，入口脚本通过 CUSTOM_OTELCOL_CONFIG_FILE 获取该路径。
+      #
+      # 上游 Dockerfile 在构建镜像时复制前三份文件，Docker 创建容器时即可从容器内读取它们。
+      # 项目目录只保存第四份，所以下方 volumes 也只列出 custom.yaml 的挂载。
       # 不从 app 获取动态配置，也不因 HyperDX 团队密钥或 UI 状态改变接收能力。
       OPAMP_SERVER_URL: ""
       # 部署前生成并保存的共享采集凭据，双方约定即可，不需要先登录 HyperDX 取得。

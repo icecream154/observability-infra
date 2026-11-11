@@ -142,6 +142,8 @@ exporters:
 # 6. 启用新增的数据库指标管道
 # -----------------------------------------------------------------------------
 # 内置 standalone 文件已连接三类业务 OTLP 管道，本段只增加 metrics/clickhouse。
+# Go 侧 log-agent 转发到中心 /v1/traces 的 Span 进入现有 otlp/hyperdx -> traces -> clickhouse，
+# 写入 otel.otel_traces，供 HyperDX 的 Traces 数据源查询。
 # 不定义 service.extensions 列表：列表在合并时会替换，保留内置 health_check 和静态 token 认证扩展。
 service:
   pipelines:

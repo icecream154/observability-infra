@@ -43,10 +43,11 @@ Collector 仅等待 ClickHouse 健康。HyperDX 查询 ClickHouse，并将自身
 | `clickhouse/retention.sql` | 可选的分类型保留规则；表创建后显式执行，不会随 Compose 自动运行 |
 | `operations/remote-access.md` | 远程 HTTP、公网 HTTPS 和多机器网络配置说明 |
 | `operations/nginx-hyperdx.conf.example` | 可选宿主机 Nginx HTTPS 示例；不会自动加载，不包含真实域名或证书 |
+| `operations/migrate-mongodb-to-volume.sh` | 将旧版 `.data/mongodb/` 一次性复制到 Docker 管理的命名卷 |
 | `operations/README.md` | 容量、备份、升级和运维边界 |
 | `dashboards/README.md` | 后续看板与统计口径约定 |
 
-`.data/` 保存数据库数据，`go.mod` 保留项目模块声明，当前 Compose 不需要编译 Go 代码。
+`.data/` 保存 ClickHouse 数据和文件日志，MongoDB 使用 Docker 管理的命名卷。`go.mod` 保留项目模块声明，当前 Compose 不需要编译 Go 代码。
 
 ## 部署前一次性配置
 
@@ -98,7 +99,7 @@ docker compose up -d
 
 Compose 根据变更更新容器。Collector 会从本地配置加载静态认证和导出管道，HyperDX 无需先创建账号。需要查看页面时，再打开 `HYPERDX_PUBLIC_URL` 并注册/登录；账号和看板等平台状态保存在 MongoDB。
 
-从旧 OpAMP 配置迁移时，先填写新增的 `OTLP_AUTH_TOKEN`，再更新容器。原有 ClickHouse/MongoDB 挂载目录继续使用，已有数据库密码、会话密钥、平台账号和表数据保留。Go/Python/Agent 上传凭据需要切换为预配置 token；旧的 HyperDX 团队 key 不会自动成为独立 Collector 的有效凭据。
+从旧 OpAMP 配置迁移时，先填写新增的 `OTLP_AUTH_TOKEN`，再更新容器。原有 ClickHouse 挂载目录继续使用。MongoDB 若仍在旧目录中，按上面的步骤先迁移平台状态。Go/Python/Agent 上传凭据需要切换为预配置 token；旧的 HyperDX 团队 key 不会自动成为独立 Collector 的有效凭据。
 
 仅修改 `.env` 后执行 `docker compose restart` 不会注入新环境变量；应使用 `docker compose up -d`。只修改挂载的 Collector 参数文件时，可重启 Collector 让其重新读取。
 
@@ -122,13 +123,15 @@ OTEL_EXPORTER_OTLP_HEADERS=authorization=<预配置token>
 
 每个逻辑服务设置 `service.name`，每个实例设置 `service.instance.id`，环境使用 `deployment.environment.name`。这些属性用于查询和区分来源，不等于自动建立租户隔离。
 
-业务机器后续分别配置：
+接入其他业务项目时，需要在业务机器配置：
 
 1. 日志输出到受轮转管理的 JSONL 文件，由该机器的 Agent 持续读取并保存读取位置。
 2. 将日志正文、时间、级别、TraceId、SpanId 和资源属性映射到标准字段，再上传。
 3. 为 Go/Python 的已有 Span 接入 OTLP 导出器；可以先发本机 Agent，再统一转发到中心。
 
-`go-service-template` 项目自己的 Compose 会一起启动 Go 服务和日志 Agent。Agent 在业务机器读取本地日志，通过上述 OTLP 入口转发到中心。
+`go-service-template` 的 Compose 一起启动 Go 服务和 `log-agent`。Go 的 OTLP HTTP 导出器将已结束的 Span 发到业务项目内部的 `http://log-agent:4318/v1/traces`，Agent 同时读取本地日志。Agent 使用相同的中心地址和 `OTLP_AUTH_TOKEN` 分别向 `/v1/traces` 和 `/v1/logs` 转发。中心 Collector 通过内置管道将数据写入 `otel.otel_traces` 和 `otel.otel_logs`。
+
+两套 Compose 启动后，向 Go 服务发起一条新请求，并从日志复制该请求的 `TraceId`。在 HyperDX 的 **Search** 选择 **Traces** 数据源，以 `TraceId:"实际的 TraceId"` 筛选，打开任意匹配的 Span 即可查看调用瀑布图。接入导出前只有日志的请求仍可查日志，瀑布图使用实际导出的 Span。
 
 ## 查询和数据保留
 
@@ -146,11 +149,11 @@ docker compose exec -T clickhouse sh -c 'exec clickhouse-client --user "$CLICKHO
 
 ## 持久化、资源与维护
 
-| 宿主机目录 | 内容 |
+| 持久化位置 | 内容 |
 | --- | --- |
 | `.data/clickhouse/` | 遥测表、数据库元数据和内部诊断数据 |
 | `.data/clickhouse-logs/` | ClickHouse 自身文本日志 |
-| `.data/mongodb/` | HyperDX 平台状态和会话 |
+| Docker 命名卷 `mongodb-data`（默认实际卷名 `observability-infra_mongodb-data`） | HyperDX 账号、会话、看板和配置 |
 
 ClickHouse/MongoDB 端口不向业务机器发布；它们只需要访问 Collector。API 调试端口仅本机访问，浏览器从前端同源 `/api` 代理进入 API。
 
@@ -162,7 +165,7 @@ ClickHouse/MongoDB 端口不向业务机器发布；它们只需要访问 Collec
 docker compose down
 ```
 
-普通重启或删除容器不会自动删除上述绑定目录。容量、备份和升级职责见[运维说明](operations/README.md)。
+普通重启、替换容器和 `docker compose down` 会保留上述数据。`docker compose down --volumes` 会删除本项目管理的 MongoDB 命名卷。容量、备份和升级职责见[运维说明](operations/README.md)。
 
 ## 官方参考
 

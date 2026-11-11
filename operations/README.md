@@ -1,6 +1,6 @@
 # 运维职责
 
-本目录预留容量治理、备份、恢复和升级任务。当前只有管理约定，没有运行中的定时任务，也没有自动删除、备份或恢复脚本。
+本目录记录容量治理、备份、恢复和升级约定，并提供手动运行的 MongoDB 数据迁移脚本。当前没有定时任务或自动备份。
 
 ## 多机器采集与远程访问
 
@@ -12,7 +12,7 @@
 
 ## 当前配置已覆盖
 
-- ClickHouse 与 MongoDB 数据绑定到 `.data/`，容器正常替换时保留数据。
+- ClickHouse 使用 `.data/` 下的绑定目录，MongoDB 使用挂载到 `/data/db` 的 Docker 命名卷 `mongodb-data`。容器正常替换时复用这些数据。
 - 每个容器自身日志轮转，以及 ClickHouse 文本日志和部分系统表保留规则。
 - 遥测新建表的统一保留参数，以及可选的分类型保留规则 SQL；已有表以实际表定义为准。
 - 容器内存限制和 Collector 内存保护。
@@ -35,6 +35,24 @@
 70% 告警、80% 清理、90% 摄入保护可以作为后续讨论的起始水位，当前并未生效。必须预留数据合并和清理本身的空间。
 
 配置硬上限后，持续超量写入时仍需要明确是缩短历史保留期还是停止接收新数据，不能同时承诺无限写入、固定磁盘和永不丢数据。
+
+## 旧版 MongoDB 数据迁移
+
+旧配置将宿主机 `.data/mongodb/` 绑定到 MongoDB 的 `/data/db`。Docker Desktop 在重新打开已有的 WiredTiger 文件时可能返回 `Operation not permitted`。当前配置使用 Docker 管理的 `mongodb-data` 卷，默认实际卷名为 `observability-infra_mongodb-data`。 [MongoDB 镜像的存储说明](https://github.com/docker-library/docs/blob/master/mongo/README.md#where-to-store-data)
+
+已有旧目录且希望保留 HyperDX 账号、看板等平台状态时，在项目根目录先运行迁移脚本，再启动 Compose。迁移沿用写入旧数据时的 `MONGODB_IMAGE` 版本。
+
+```bash
+./operations/migrate-mongodb-to-volume.sh
+```
+
+脚本停止 `app` 和 `mongodb`，把旧目录的全部文件（包括 journal）复制到空的命名卷，并在卷内调整文件属主。它保留原目录，发现目标卷已有文件时会停止。复制成功后再执行下面的命令，然后登录 HyperDX 确认已有账号和看板。
+
+```bash
+docker compose up -d
+```
+
+首次部署时，直接运行 `docker compose up -d` 由 Compose 创建卷。普通 `docker compose down` 保留卷，`docker compose down --volumes` 会删除这个卷及其中的 HyperDX 平台数据。
 
 ## 备份和恢复
 

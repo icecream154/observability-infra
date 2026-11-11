@@ -154,12 +154,11 @@ services:
     # 整个容器的内存上限默认 1 GiB，可由 shell 环境或 .env 中的 MONGODB_MEMORY_LIMIT 覆盖。
     # 缓存、连接和查询等共同消耗这份内存；不是启动即占满，也不限制数据库的磁盘容量。
     mem_limit: ${MONGODB_MEMORY_LIMIT:-1g}
-    # 宿主机目录绑定：左侧为本项目目录下的路径，右侧为容器内路径；默认可读写。
+    # MongoDB 的 /data/db 使用 Docker 管理的命名卷，保存在 Docker 的 Linux 文件系统内。
     volumes:
-      # MongoDB 向 /data/db 写入的数据库文件实际保存在电脑 .data/mongodb/，包含平台配置等内容。
-      # 停止、删除或重建容器不会自动删除宿主机目录；挂载同一路径即可复用已有数据。
-      # 此目录与保存业务遥测明细的 .data/clickhouse/ 分别管理；绑定本身没有磁盘硬配额。
-      - ./.data/mongodb:/data/db
+      # 容器重建后复用同一卷。使用 Docker Desktop 时，WiredTiger 直接操作卷内文件，绕过 Mac 目录共享层。
+      # 旧版 .data/mongodb/ 的平台账号和配置可在启动前通过 operations/migrate-mongodb-to-volume.sh 迁入。
+      - mongodb-data:/data/db
     # 健康检查在 MongoDB 容器内部执行；app 在启动时等待本服务达到 healthy 状态。
     healthcheck:
       # CMD 直接执行 mongo 客户端及参数，不经过 shell；这里的 mongo 是 5.0 镜像中的命令行客户端。
@@ -288,6 +287,7 @@ services:
       # Traces：查询 otel.otel_traces，ParentSpanId 组织父子关系，SpanName/SpanKind 表示操作名和角色；
       #   Duration 为耗时，durationPrecision=9 表示纳秒，列表的 round(Duration/1e6) 换算为整数毫秒；
       #   StatusCode/StatusMessage 为状态，Events 为 Span 内事件，Links 为与其他 Span 的链接。
+      #   在 Search 选择 Traces，按 TraceId 找到一条 Span 并打开详情，可查看整条调用的瀑布图。
       # Metrics：按 metricTables 在 gauge/sum/histogram/summary/exponential histogram 五类表之间选择；
       #   因此 from.tableName 为空不是漏填，数据库仍为 otel，时间字段为 TimeUnix。
       # traceSourceId/logSourceId/metricSourceId 在默认 JSON 中按数据源名称引用，创建时解析为实际 ID。
@@ -330,6 +330,8 @@ services:
   # 本服务作为遥测网关：业务服务 SDK / 客户端采集器 -> OTLP 接收器 -> 处理器 -> ClickHouse 导出器。
   # 业务遥测直接写入 ClickHouse；app/MongoDB 仅负责查询展示及平台状态，不中转或授权这些明细。
   # 数据通路为发送端 -> collector:4317/4318 -> clickhouse:9000；
+  # Go 应用将 Span 发到业务项目内的 log-agent。Agent 携带 OTLP_AUTH_TOKEN 转发到中心 /v1/traces，
+  # 由镜像内置 traces 管道写入 otel.otel_traces。日志走 /v1/logs，并通过相同 TraceId 与 Span 关联。
   # 所有业务机器共用可达的中心采集入口，通过 service.name、service.instance.id、环境属性区分来源。
   # 远端发送地址使用中心服务器的内网 IP/域名；collector、clickhouse 等服务名仅用于本 Compose 内部。
   # 当前没有挂载电脑业务日志目录或 Docker socket，不会自动读取 Go 项目终端输出。
@@ -439,3 +441,7 @@ services:
     # 内置导出器存在重试/内存缓冲，但当前未配置持久发送队列，故障或重试耗尽时仍可能丢数据。
     # logging 只复用顶部 local 日志轮转规则，管理此容器的 stdout/stderr，不限制遥测表或采集缓冲大小。
     logging: *container-logging
+
+volumes:
+  # 默认卷名 observability-infra_mongodb-data。普通 stop/down 保留该卷，down --volumes 会删除它。
+  mongodb-data:

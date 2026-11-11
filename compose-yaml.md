@@ -4,7 +4,7 @@
 
 四个中心组件仍放在同一个 [compose.yaml](compose.yaml) 中。Collector 的配置和采集认证由本地文件及预配置密钥管理，不再依赖 HyperDX 注册账号或通过 OpAMP 下发配置。这里的“独立”描述组件之间的控制关系，不要求拆成不同服务器或不同 Compose。
 
-当前中心配置已提供远程采集入口、静态认证、处理管道和数据库导出。业务机器上的日志 Agent、Go/Python 的日志落盘和 Span 导出仍需要在各业务项目中接入；启动中心容器不会自动读取其他机器的终端日志。
+当前中心配置已提供远程采集入口、静态认证、处理管道和数据库导出。`go-service-template` 在自己的 Compose 中配置了本地 Agent 和 Span 导出，其他业务项目可以按相同的 OTLP 接入约定配置。
 
 ## 1 整体部署和数据去向
 
@@ -160,7 +160,9 @@ XML 管理文本日志级别与轮转、部分系统诊断表 TTL，以及 `9363
 
 ## 5 MongoDB 服务
 
-默认镜像为 `mongo:5.0.32-focal`，默认容器内存上限为 1 GiB。`.data/mongodb/` 绑定到 `/data/db`，保存平台状态，并不保存业务遥测明细。
+默认镜像为 `mongo:5.0.32-focal`，默认容器内存上限为 1 GiB。Docker 管理的命名卷 `mongodb-data` 挂载到 `/data/db`，保存平台账号、会话和看板。业务遥测明细存入 ClickHouse。
+
+旧版把 Mac 上的 `.data/mongodb/` 绑定到 `/data/db`，重启时可能在打开已有的 `WiredTiger.wt` 文件时报 `Operation not permitted`。命名卷让 MongoDB 在 Docker 虚拟机内直接访问数据库文件。已有旧目录时，先按[迁移步骤](operations/README.md#旧版-mongodb-数据迁移)复制数据，再启动中心服务。 [MongoDB 镜像的存储说明](https://github.com/docker-library/docs/blob/master/mongo/README.md#where-to-store-data)
 
 当前 MongoDB 没有启用数据库认证，也没有发布宿主机数据库端口。HyperDX 使用 `mongodb://mongodb:27017/hyperdx` 连接。网页登录账号与 MongoDB 数据库账号是两套身份。
 
@@ -428,9 +430,11 @@ flowchart LR
     Logs -.->|相同 TraceId 和 SpanId| Traces
 ```
 
-图中 Span 经本机 Agent 转发是一种接入方式，也可以由 SDK 直接发中心。真正的调用树来自 Span 的父子关系；只在日志正文中打印一个 TraceId 不会自动生成调用树。
+图中 Span 经本机 Agent 转发是一种接入方式，也可以由 SDK 直接发中心。HyperDX 使用 Span 的 `ParentSpanId` 组织调用树，用相同的 `TraceId` 查询关联日志。
 
-Go 项目现有公共 Logger 已具备 stdout 单行 JSON，Tracing 已有部分 Span 边界。中心配置没有把 stdout 自动保存成文件，也没有为业务 SDK 装配导出器；这些需要在 Go/Python 项目和业务机器部署中继续实现。
+在 `go-service-template` 的 Compose 部署中，应用把 Span 发到 `http://log-agent:4318/v1/traces`。本地 Agent 也从共享卷读取 JSONL 日志，再使用同一中心地址和采集凭据分别转发两类数据。中心镜像内置的 `traces` 管道写入 `otel.otel_traces`。
+
+在 HyperDX 的 **Search → Traces** 按 `TraceId` 筛选并打开一条匹配的 Span，即可查看该请求的调用瀑布图。部署新导出器后，以新请求的 `TraceId` 查找实际导出的 Span。
 
 日志 Agent 应按下面的约定解析业务 JSON：
 
@@ -516,11 +520,11 @@ OTLP HTTP 可以同时承载日志和 Span，因此不必为了两类数据分�
 
 启动宽限期内仍会执行检查，成功可提前进入健康状态。健康状态不证明远端网络、业务 SDK 导出、日志字段转换和页面关联都已完成。正常运行中，暂时连接失败由相应客户端和导出器恢复，`depends_on` 不承担运行时故障编排。
 
-| 宿主机目录 | 保留的内容 |
+| 持久化位置 | 保留的内容 |
 | --- | --- |
 | `.data/clickhouse/` | 遥测表、表定义、数据库内部数据 |
 | `.data/clickhouse-logs/` | 数据库文本日志 |
-| `.data/mongodb/` | 平台账号、会话、看板、连接和数据源 |
+| Docker 命名卷 `mongodb-data`（默认实际卷名 `observability-infra_mongodb-data`） | 平台账号、会话、看板、连接和数据源 |
 
 当前没有配置持久发送队列、总磁盘硬配额、自动容量水位清理或备份任务。内置的内存缓冲和重试可处理部分暂时失败，但不能等同于磁盘持久队列。业务侧日志文件读取位置、队列、轮转和数据保留应纳入各自部署设计。
 
@@ -536,9 +540,9 @@ OTLP HTTP 可以同时承载日志和 Span，因此不必为了两类数据分�
 | 改新团队的默认查询配置 | `DEFAULT_CONNECTIONS` / `DEFAULT_SOURCES` | 更新初始化模板，不覆盖已有配置 |
 | 改业务日志格式、文件目录、Span 边界或 SDK 导出 | Go/Python 与各业务机器 Agent | 按业务进程自身的部署方式应用 |
 
-中心的一般启动入口是项目目录下的 `docker compose up -d`。它会根据配置变化更新容器；单纯 `docker compose restart` 会保留旧容器环境，不能用于注入新的 Compose 环境变量。正常停止或替换容器不会自动删除数据库绑定目录。
+中心的一般启动入口是项目目录下的 `docker compose up -d`。它会根据配置变化更新容器；单纯 `docker compose restart` 会保留旧容器环境，不能用于注入新的 Compose 环境变量。`docker compose down` 保留 ClickHouse 绑定目录和 MongoDB 命名卷，带 `--volumes` 的 `down` 会删除本项目管理的 MongoDB 卷。
 
-中心配置就绪后，业务侧仍需要完成日志文件与 Agent、Span 导出器、导出凭据和生命周期收尾的接入。正常请求产生日志和结束 Span 后，才有对应遥测供中心接收与展示。
+启动业务 Compose 前，将本地 Agent 的中心地址和采集凭据配置为与目标环境一致。正常请求产生日志和结束 Span 后，Agent 将对应遥测发往中心供 HyperDX 查询。
 
 ## 13 配置参数总览
 

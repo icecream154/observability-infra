@@ -41,15 +41,21 @@ Collector 仅等待 ClickHouse 健康。HyperDX 查询 ClickHouse，并将自身
 | `collector/README.md` | 独立采集模式、凭据、管道及业务机器接入约定 |
 | `clickhouse/config.d/observability.xml` | ClickHouse 文件日志、系统诊断表 TTL 和内部 `9363/metrics` 入口 |
 | `clickhouse/retention.sql` | 可选的分类型保留规则；表创建后显式执行，不会随 Compose 自动运行 |
+| `operations/deployment-guide.md` | 生产/测试环境完整部署指南（中心一键部署 + Nginx HTTPS + `log-agent` 构建 + 业务 ECS 初始化 + CI/CD 接入） |
+| `operations/deploy-center.sh` | 中心服务器一键初始化与部署脚本（自动装 Docker/Compose、生成 `.env`、启动四组件） |
+| `operations/init-ecs.sh` | 业务 ECS 一键初始化脚本（装 Docker/Compose、登录 ACR、安装 `/opt/bin/service-ctl.sh`） |
+| `operations/service-ctl.sh` | 业务 ECS 通用无状态 Compose 发布与自动回滚脚本 |
 | `operations/remote-access.md` | 远程 HTTP、公网 HTTPS 和多机器网络配置说明 |
 | `operations/nginx-hyperdx.conf.example` | 可选宿主机 Nginx HTTPS 示例；不会自动加载，不包含真实域名或证书 |
-| `operations/migrate-mongodb-to-volume.sh` | 将旧版 `.data/mongodb/` 一次性复制到 Docker 管理的命名卷 |
 | `operations/README.md` | 容量、备份、升级和运维边界 |
+| `agent/README.md` | 公共业务采集边车镜像 `log-agent` 的构建与推送说明（本仓库唯一需自行构建的镜像） |
 | `dashboards/README.md` | 后续看板与统计口径约定 |
 
 `.data/` 保存 ClickHouse 数据和文件日志，MongoDB 使用 Docker 管理的命名卷。`go.mod` 保留项目模块声明，当前 Compose 不需要编译 Go 代码。
 
 ## 部署前一次性配置
+
+> **完整部署指南与一键脚本（推荐）**：端到端步骤（含 Nginx HTTPS 配置、`log-agent` 构建、业务 ECS 初始化与云效流水线接入）请直接阅读 [生产/测试环境完整部署指南](operations/deployment-guide.md)。将本仓库拉到中心服务器后，编辑 [operations/deploy-center.sh](operations/deploy-center.sh) 填写顶部的 `HYPERDX_PUBLIC_URL`（3 个密钥留空即可自动生成并安全写入 `.env`），随后执行 `sudo sh operations/deploy-center.sh` 即可一键完成部署。如需手工分步配置，按下方步骤执行。
 
 ### 1. 准备私有配置和三种密钥
 

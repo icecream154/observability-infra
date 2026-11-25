@@ -10,6 +10,12 @@
 
 [宿主机 Nginx 示例](nginx-hyperdx.conf.example) 包含整个 HyperDX 站点的 HTTPS 转发，以及可选 OTLP HTTP HTTPS 入口。示例不自动加载或申请证书；域名、证书、端口和网络入口由部署方按实际环境配置。
 
+完整端到端上线手册见 [生产/测试环境完整部署指南](deployment-guide.md)（包含中心一键部署、Nginx SSL 配置、`log-agent` 构建、业务 ECS 初始化与 CI/CD 流水线接入）。
+
+中心服务器的一键初始化与部署可使用 [deploy-center.sh](deploy-center.sh)：将仓库拉到中心服务器后，原地填写脚本顶部的 `HYPERDX_PUBLIC_URL`（3 个密钥留空会自动随机生成并在重复执行时保留已有 `.env` 值；国内若需改走自有 ACR 拉取 4 个基础镜像也可在脚本中一并填写），执行 `sudo sh operations/deploy-center.sh` 即可自动完成 Docker/Compose 安装、`.env` 生成与中心四组件启动。
+
+业务服务器的无状态 Compose 部署可使用 [service-ctl.sh](service-ctl.sh) 搭配公共采集镜像 [../agent/](../agent/README.md)：业务配置随业务镜像交付，采集规则固化在 `log-agent` 镜像内，宿主机仅维护该通用更新与回滚脚本。新业务 ECS 可直接将 [init-ecs.sh](init-ecs.sh) 与 [service-ctl.sh](service-ctl.sh) 复制到服务器，填写 ACR 仓库地址、用户名、密码后执行一次完成 Docker/Compose 安装、ACR 登录与 `/opt/bin/service-ctl.sh` 安装。
+
 ## 当前配置已覆盖
 
 - ClickHouse 使用 `.data/` 下的绑定目录，MongoDB 使用挂载到 `/data/db` 的 Docker 命名卷 `mongodb-data`。容器正常替换时复用这些数据。

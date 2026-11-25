@@ -1,0 +1,91 @@
+# Go 与 Python 业务服务共用的本地 Sidecar 采集配置。
+# 读取业务容器写入共享命名卷的轮转 JSONL 日志，并在同一 Compose 网络内接收 OTLP HTTP Span，
+# 经内存限流、攒批与本地磁盘持久化队列转发至中心 Collector。
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol
+
+receivers:
+  # 业务容器通过内部服务名 http://log-agent:4318/v1/traces 上报已结束的 Span。
+  otlp/app:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # 匹配当前活跃文件 app.jsonl 及进程内按大小轮转生成的 app.jsonl.1 .. app.jsonl.N；
+  # filelog 基于文件头指纹而非文件名保存偏移量，重命名轮转期间不丢行、不重复读取。
+  filelog/app:
+    include: [/app/.data/logs/app*.jsonl*]
+    start_at: beginning
+    storage: file_storage
+    retry_on_failure:
+      enabled: true
+    operators:
+      - type: json_parser
+        on_error: drop_quiet
+        timestamp:
+          parse_from: attributes.timestamp
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.999999999Z07:00'
+        severity:
+          parse_from: attributes.level
+        trace:
+          trace_id:
+            parse_from: attributes.trace_id
+          span_id:
+            parse_from: attributes.span_id
+      - type: move
+        id: message_to_body
+        from: attributes.message
+        to: body
+      - type: move
+        id: service_name_to_resource
+        from: attributes.service_name
+        to: 'resource["service.name"]'
+      - type: move
+        id: environment_to_resource
+        from: attributes.environment
+        to: 'resource["deployment.environment.name"]'
+      - type: move
+        id: instance_id_to_resource
+        from: attributes.instance_id
+        to: 'resource["service.instance.id"]'
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 200
+    spike_limit_mib: 40
+  batch:
+    send_batch_size: 1024
+    timeout: 2s
+
+exporters:
+  otlp_http/central:
+    # 传入中心 OTLP HTTP 基础地址（如 http://10.0.1.5:4318），导出器自动追加 /v1/logs 或 /v1/traces。
+    endpoint: '${env:OTLP_ENDPOINT}'
+    headers:
+      authorization: 'Bearer ${env:OTLP_AUTH_TOKEN}'
+    # 中心维护重启或跨机网络短暂抖动时自动退避重试，并将待发送批次落盘至 /var/lib/otelcol。
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 0s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 1000
+      storage: file_storage
+
+service:
+  extensions: [file_storage]
+  pipelines:
+    logs/app:
+      receivers: [filelog/app]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/central]
+    traces/app:
+      receivers: [otlp/app]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/central]

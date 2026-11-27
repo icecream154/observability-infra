@@ -1,6 +1,6 @@
 #!/bin/sh
 # 中心可观测服务器（observability-infra）一键初始化与部署脚本：
-#   1. 检查并安装 Docker 与 docker compose 插件（国内 ECS 默认走阿里云镜像源）
+#   1. 检查并安装 Docker 与 docker compose 插件（优先自动探测阿里云内网源，回退清华源）
 #   2. 可选登录私有镜像仓库（如阿里云 ACR，用于国内加速拉取 4 个基础镜像）
 #   3. 生成或安全更新项目根目录 .env（首次留空密钥会自动随机生成，重复执行默认保留已有密钥）
 #   4. 启动中心四组件（ClickHouse + MongoDB + 独立 Collector + HyperDX）
@@ -62,7 +62,8 @@ CLICKSTACK_APP_MEMORY_LIMIT="${CLICKSTACK_APP_MEMORY_LIMIT:-2g}"
 MONGODB_MEMORY_LIMIT="${MONGODB_MEMORY_LIMIT:-1g}"
 COLLECTOR_MEMORY_LIMIT="${COLLECTOR_MEMORY_LIMIT:-1g}"
 
-DOCKER_MIRROR_BASE="${DOCKER_MIRROR_BASE:-https://mirrors.aliyun.com/docker-ce}"
+# Docker CE 软件源（留空时自动探测：阿里云 VPC 内网源 -> 清华源 -> 阿里云公网源）
+DOCKER_MIRROR_BASE="${DOCKER_MIRROR_BASE:-}"
 
 # 默认官方镜像版本（与 .env.example 保持一致）
 DEFAULT_CLICKSTACK_APP_IMAGE="hyperdx/hyperdx:2.43.1"
@@ -182,13 +183,41 @@ resolve_secret() {
   gen_hex_secret
 }
 
+resolve_docker_mirror_base() {
+  probe_subpath="$1"
+
+  if [ -n "$DOCKER_MIRROR_BASE" ]; then
+    DOCKER_MIRROR_BASE=$(printf '%s' "$DOCKER_MIRROR_BASE" | sed -e 's#/*$##')
+    log "使用指定的 Docker 软件源: ${DOCKER_MIRROR_BASE}"
+    return 0
+  fi
+
+  for candidate in \
+    "http://mirrors.cloud.aliyuncs.com/docker-ce" \
+    "https://mirrors.tuna.tsinghua.edu.cn/docker-ce" \
+    "https://mirrors.aliyun.com/docker-ce"
+  do
+    if curl -fsSL --connect-timeout 2 --max-time 5 "${candidate}/${probe_subpath}" >/dev/null 2>&1; then
+      DOCKER_MIRROR_BASE="$candidate"
+      log "已自动探测并选用 Docker 软件源: ${DOCKER_MIRROR_BASE}"
+      return 0
+    fi
+  done
+
+  DOCKER_MIRROR_BASE="https://mirrors.tuna.tsinghua.edu.cn/docker-ce"
+  log "软件源探测超时，回退默认 Docker 软件源: ${DOCKER_MIRROR_BASE}"
+}
+
 install_docker_debian() {
   os_id="$1"
   codename="$2"
 
   export DEBIAN_FRONTEND=noninteractive
+  rm -f /etc/apt/sources.list.d/docker.list
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg
+
+  resolve_docker_mirror_base "linux/${os_id}/gpg"
 
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL "${DOCKER_MIRROR_BASE}/linux/${os_id}/gpg" | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
@@ -215,12 +244,22 @@ install_docker_rhel() {
     exit 1
   fi
 
-  "$pkg_mgr" -y install curl yum-utils || "$pkg_mgr" -y install curl dnf-utils
+  rm -f /etc/yum.repos.d/docker-ce.repo
+  "$pkg_mgr" -y install curl ca-certificates yum-utils || "$pkg_mgr" -y install curl ca-certificates dnf-utils
+
+  resolve_docker_mirror_base "linux/centos/docker-ce.repo"
 
   if [ "$pkg_mgr" = "dnf" ]; then
     dnf config-manager --add-repo "${DOCKER_MIRROR_BASE}/linux/centos/docker-ce.repo"
   else
     yum-config-manager --add-repo "${DOCKER_MIRROR_BASE}/linux/centos/docker-ce.repo"
+  fi
+
+  if [ -f /etc/yum.repos.d/docker-ce.repo ]; then
+    sed -i \
+      -e "s#https://download.docker.com#${DOCKER_MIRROR_BASE}#g" \
+      -e "s#https://mirrors.aliyun.com/docker-ce#${DOCKER_MIRROR_BASE}#g" \
+      /etc/yum.repos.d/docker-ce.repo
   fi
 
   if [ "$os_id" = "alinux" ] && [ "${version_id%%.*}" = "3" ]; then

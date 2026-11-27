@@ -51,7 +51,7 @@ LOG_AGENT_IMAGE=""
 OTLP_ENDPOINT=""
 BIND_ADDRESS="0.0.0.0"
 APP_REGION="cn"
-WAIT_SECONDS="5"
+WAIT_SECONDS="30"
 HEALTH_URL=""
 STATE_ROOT="${SERVICE_CTL_STATE_ROOT:-/var/lib/service-ctl}"
 
@@ -255,15 +255,24 @@ EOF
 }
 
 verify_health() {
-  sleep "$WAIT_SECONDS"
-  running_count=$(docker compose -p "$PROJECT_NAME" ps --status running -q | wc -l | tr -d ' ')
-  if [ "$running_count" -lt 2 ]; then
-    return 1
-  fi
-  if [ -n "$HEALTH_URL" ]; then
-    curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null || return 1
-  fi
-  return 0
+  elapsed=0
+  while [ "$elapsed" -lt "$WAIT_SECONDS" ]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    running_count=$(docker compose -p "$PROJECT_NAME" ps --status running -q | wc -l | tr -d ' ')
+    if [ "$running_count" -lt 2 ]; then
+      continue
+    fi
+    if [ -z "$HEALTH_URL" ]; then
+      return 0
+    fi
+    if curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  printf '[ERROR] Health check timed out after %ss. Recent app container logs:\n' "$WAIT_SECONDS" >&2
+  docker compose -p "$PROJECT_NAME" logs --tail=30 app >&2 || true
+  return 1
 }
 
 if [ "$ACTION" = "rollback" ]; then

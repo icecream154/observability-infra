@@ -1,6 +1,6 @@
 #!/bin/sh
 # 业务 ECS 服务器一次性初始化脚本：
-#   1. 检查并安装 Docker 与 docker compose 插件（国内 ECS 默认走阿里云镜像源）
+#   1. 检查并安装 Docker 与 docker compose 插件（优先自动探测阿里云内网源，回退清华源）
 #   2. 登录阿里云 ACR（推荐使用同地域 VPC 内网域名，凭证保存在 /root/.docker/config.json）
 #   3. 安装通用发布脚本 service-ctl.sh 到 /opt/bin/service-ctl.sh 并赋权
 #
@@ -27,7 +27,8 @@ SERVICE_CTL_TARGET="${SERVICE_CTL_TARGET:-/opt/bin/service-ctl.sh}"
 SERVICE_CTL_SOURCE="${SERVICE_CTL_SOURCE:-}"   # 留空时默认读取与本脚本同目录的 service-ctl.sh
 SERVICE_CTL_URL="${SERVICE_CTL_URL:-}"         # 若未一同上传 service-ctl.sh，可填写其下载地址
 STATE_ROOT="${STATE_ROOT:-/var/lib/service-ctl}"
-DOCKER_MIRROR_BASE="${DOCKER_MIRROR_BASE:-https://mirrors.aliyun.com/docker-ce}"
+# Docker CE 软件源（留空时自动探测：阿里云 VPC 内网源 -> 清华源 -> 阿里云公网源）
+DOCKER_MIRROR_BASE="${DOCKER_MIRROR_BASE:-}"
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
@@ -95,13 +96,41 @@ resolve_service_ctl_source() {
   exit 1
 }
 
+resolve_docker_mirror_base() {
+  probe_subpath="$1"
+
+  if [ -n "$DOCKER_MIRROR_BASE" ]; then
+    DOCKER_MIRROR_BASE=$(printf '%s' "$DOCKER_MIRROR_BASE" | sed -e 's#/*$##')
+    log "使用指定的 Docker 软件源: ${DOCKER_MIRROR_BASE}"
+    return 0
+  fi
+
+  for candidate in \
+    "http://mirrors.cloud.aliyuncs.com/docker-ce" \
+    "https://mirrors.tuna.tsinghua.edu.cn/docker-ce" \
+    "https://mirrors.aliyun.com/docker-ce"
+  do
+    if curl -fsSL --connect-timeout 2 --max-time 5 "${candidate}/${probe_subpath}" >/dev/null 2>&1; then
+      DOCKER_MIRROR_BASE="$candidate"
+      log "已自动探测并选用 Docker 软件源: ${DOCKER_MIRROR_BASE}"
+      return 0
+    fi
+  done
+
+  DOCKER_MIRROR_BASE="https://mirrors.tuna.tsinghua.edu.cn/docker-ce"
+  log "软件源探测超时，回退默认 Docker 软件源: ${DOCKER_MIRROR_BASE}"
+}
+
 install_docker_debian() {
   os_id="$1"
   codename="$2"
 
   export DEBIAN_FRONTEND=noninteractive
+  rm -f /etc/apt/sources.list.d/docker.list
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg
+
+  resolve_docker_mirror_base "linux/${os_id}/gpg"
 
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL "${DOCKER_MIRROR_BASE}/linux/${os_id}/gpg" | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
@@ -128,12 +157,22 @@ install_docker_rhel() {
     exit 1
   fi
 
-  "$pkg_mgr" -y install curl yum-utils || "$pkg_mgr" -y install curl dnf-utils
+  rm -f /etc/yum.repos.d/docker-ce.repo
+  "$pkg_mgr" -y install curl ca-certificates yum-utils || "$pkg_mgr" -y install curl ca-certificates dnf-utils
+
+  resolve_docker_mirror_base "linux/centos/docker-ce.repo"
 
   if [ "$pkg_mgr" = "dnf" ]; then
     dnf config-manager --add-repo "${DOCKER_MIRROR_BASE}/linux/centos/docker-ce.repo"
   else
     yum-config-manager --add-repo "${DOCKER_MIRROR_BASE}/linux/centos/docker-ce.repo"
+  fi
+
+  if [ -f /etc/yum.repos.d/docker-ce.repo ]; then
+    sed -i \
+      -e "s#https://download.docker.com#${DOCKER_MIRROR_BASE}#g" \
+      -e "s#https://mirrors.aliyun.com/docker-ce#${DOCKER_MIRROR_BASE}#g" \
+      /etc/yum.repos.d/docker-ce.repo
   fi
 
   # Alibaba Cloud Linux 3 需要将 releasever 映射为兼容的 CentOS 版本
